@@ -1,6 +1,8 @@
-# 模块接口约定 v1（设计）
+# 模块接口约定 v1（M1 检查点）
 
 陈子星维护共享接口，#1 的 M1 检查点确认字段。课程数据接入后核对具体类型和配对方式。
+
+共享可执行类型见 `backend/app/schemas/models.py`，模块接入协议见 `backend/app/schemas/ports.py`；请求示例、错误处理、持久化和剩余依赖见[后端联调说明](backend.md)。
 
 ## 1. 输入与版本准备
 
@@ -59,12 +61,15 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 | `GET /api/tasks/{task_id}/reports` | 完整报告与失败项 |
 | `GET /api/tasks/{task_id}/result.jsonl` | 导出覆盖全部输入的课程结果 |
 | `POST /api/snapshots` | 按 `commit_url`、`revision` 准备快照 |
+| `GET /api/tasks/{task_id}/measurements` | 查询逐样本实验配置、调用/token/耗时与执行状态 |
+
+快照请求另含 `idx` 和 `func`，响应为可直接提交单条检测的 `idx/func/snapshot_ref`。批量 multipart 上传字段名为 `file`。
 
 创建任务返回 `task_id`，状态为 `queued`、`running`、`completed`、`failed`。批量任务保留已完成报告，含失败项时返回失败状态。
 
 单条请求的 JSON 顶层及批量请求的 multipart 表单均接受可选 `mode`：`function_only`（函数基线）、`rag_context`（课程基础方案）、`conditions`（条件方案，默认值）。`mode` 属于运行配置，由服务选择工具与提示词，不加入样本内容；未知值返回参数错误。任务状态响应回传实际 `mode`，供评测核对。
 
-错误使用 `code`、`message`，按上下文关联 `task_id`、`idx`。具体 HTTP 响应随 #5 实现补充。
+错误使用 `code`、`message`，按上下文关联 `task_id`、`idx`。参数错误返回 HTTP 422，任务不存在返回 404，结果尚未完整或任务失败导致不可导出返回 409，缺失模块依赖返回 503。异步样本失败保存在任务失败项和 `error` 事件中，不将已接受的任务响应改为同步报错。
 
 ## 5. 证据与条件
 
@@ -93,7 +98,7 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 
 公共字段：`task_id`、`seq`、`timestamp`、`type`、`payload`；样本事件含 `idx`。`seq` 在任务内递增，SSE 的 `id` 使用该序号。
 
-报告接口返回 `{task_id, seq, reports, active_samples, failures}`，是截至 `seq` 的一致状态快照。`reports` 为成功完成的完整报告；`active_samples` 包含运行中样本的 `idx`、当前 `hypotheses/conditions/evidence/trace`，尚无最终 `prediction`。任务仍可查询期间，事件接口支持 `after_seq`（首次连接默认 0）或 `Last-Event-ID`，先重放该序号之后的事件，再连续推送新事件；两者同时提供时以 `after_seq` 为准。
+报告接口返回 `{task_id, seq, reports, active_samples, failed_samples, failures}`，是截至 `seq` 的一致状态快照。`reports` 为成功完成的完整报告；`active_samples` 包含运行中样本的 `idx`、当前 `hypotheses/conditions/evidence/trace`，尚无最终 `prediction`。`failed_samples` 保留失败或中断样本最后的部分分析，结构与 `active_samples` 相同，失败原因在 `failures` 中按原类型 `idx` 关联。UI 收到 `error` 时将对应样本从运行中移到失败状态，保留已有分析。任务仍可查询期间，事件接口支持 `after_seq`（首次连接默认 0）或 `Last-Event-ID`，先重放该序号之后的事件，再连续推送新事件；两者同时提供时以 `after_seq` 为准。
 
 初次加载或重连时，UI 读取报告快照，再从其 `seq` 订阅事件。UI 只应用比本地已应用序号更新的事件；迟到且 `seq` 更小的快照不覆盖当前状态。这样可恢复进行中的分析，并避免重连时回滚状态。
 
@@ -118,4 +123,4 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 
 #5 提供函数基线、课程基础方案和条件方案三种实验配置，#7 通过创建任务时的 `mode` 选择，并核对响应中的实际模式。正式 Web/Bot 使用 `conditions`。
 
-每次运行记录模式、模型与解码设置、数据/索引版本、运行预算、工具调用次数、token 用量、耗时和执行状态。服务未返回的用量标为缺失。测量信息单独保存，课程导出保持两字段格式。
+每次运行记录模式、模型与解码设置、数据/索引版本、运行预算、工具调用次数、token 用量、耗时和执行状态。服务未返回的用量标为缺失。进程中断后无法恢复的调用次数和耗时为 `null`，未开始的排队样本这些值为 0，不将未知成本计作 0。工具次数包含函数定位和检索/仓库操作，不含 `update_conditions/finish` 控制调用；全部模型轮次仍受模型调用预算约束。测量信息单独保存，课程导出保持两字段格式。

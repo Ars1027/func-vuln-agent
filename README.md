@@ -2,7 +2,7 @@
 
 **面向 C/C++ 单函数的漏洞检测 Agent：从历史漏洞中提取成立条件，按需查找代码证据，并检查能够推翻初步判断的安全条件。**
 
-> 设计阶段 · 高级软件工程课程项目
+> 后端合成联调阶段 · 高级软件工程课程项目
 
 [开发任务](https://github.com/Ars1027/func-vuln-agent/issues) · [检测方法](docs/method.md) · [接口约定](docs/interfaces.md) · [团队分工](docs/team.md) · [AI 提示词](docs/prompts/README.md)
 
@@ -12,7 +12,7 @@
 
 检测方法围绕“漏洞成立需要哪些条件”展开。例如，遇到 `memcpy(dst, src, len)`，Agent 会查找目标缓冲区容量、长度来源和调用路径上的边界检查，再判断是否存在越界。历史案例提供检索线索，待测版本中的代码提供判断证据。
 
-计划在课程要求的 RAG 和按需仓库读取基础上，加入**条件驱动的证据补全与反证检查**。其效果由对照实验检验，当前尚无评测结果。
+检测内核在课程要求的 RAG 和按需仓库读取接口上，加入了**条件驱动的证据补全与反证检查**。真实模块接入后的效果由对照实验检验，当前尚无课程评测结果。
 
 ## 检测流程
 
@@ -34,7 +34,14 @@ flowchart TD
 - **GitHub Bot**：在课程闭环完成后接入，按显式提交、文件和函数触发同一检测服务。
 - **运行**：先在本地完成开发和演示；需要持续在线访问时，再部署到 Linux 云服务器。
 
-技术路线为 **Python + LangGraph + FastAPI + React/TypeScript**，过程事件通过 SSE 推送。实际启动命令随实现补充。
+技术路线为 **Python + LangGraph + FastAPI + React/TypeScript**，过程事件通过 SSE 推送。当前已提供后端自主检测循环、任务与事件 API，以及无需课程数据或模型密钥的合成联调入口：
+
+```sh
+uv sync --locked
+uv run uvicorn app.demo:build_app --factory --app-dir backend --host 127.0.0.1 --port 8000
+```
+
+打开 `http://127.0.0.1:8000/docs`，或上传 `examples/synthetic.jsonl` 测试批量流程。演示使用脚本模型与人工合成材料，不代表真实检测效果。实际 RAG、快照、课程导出和 Web 待各模块接入，运行配置及接口交接见[后端联调说明](docs/backend.md)。
 
 ## 团队与任务
 
