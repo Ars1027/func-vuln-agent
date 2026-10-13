@@ -535,13 +535,16 @@ def create_app(
             store.complete(task_id)
         except asyncio.CancelledError:
             for child in children:
-                child.cancel()
+                # gather may have already cancelled children that are still cleaning up.
+                if not child.done() and not child.cancelling():
+                    child.cancel()
             await asyncio.gather(*children, return_exceptions=True)
             raise
         except Exception as exc:
             log_failure(logger, "run_task", exc, task_id=task_id)
             for child in children:
-                child.cancel()
+                if not child.done() and not child.cancelling():
+                    child.cancel()
             await asyncio.gather(*children, return_exceptions=True)
             try:
                 store.abort(task_id, "internal_error", "Task execution failed.")

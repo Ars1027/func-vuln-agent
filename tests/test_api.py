@@ -4,6 +4,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from app.api import create_app
@@ -577,6 +578,33 @@ def test_mismatched_measurement_config_discards_untrusted_costs(tmp_path, failed
         assert measurement["input_tokens"] is None
         assert measurement["output_tokens"] is None
         assert measurement["elapsed_seconds"] < 999
+
+
+@pytest.mark.parametrize("indices", [["pending"], ["pending", "queued"]])
+def test_shutdown_waits_for_running_sample_cleanup(tmp_path, indices):
+    class ShutdownRunner(Runner):
+        def __init__(self):
+            super().__init__()
+            self.started = Event()
+            self.cleaned_up = Event()
+
+        async def run(self, sample, mode, emit):
+            await super().run(sample, mode, emit)
+            try:
+                self.started.set()
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0.01)
+                self.cleaned_up.set()
+
+    runner = ShutdownRunner()
+    app, _, _ = app_for(tmp_path / "tasks.db", runner, concurrency=1)
+    with TestClient(app) as client:
+        assert submit_batch(client, indices).status_code == 202
+        assert runner.started.wait(timeout=5)
+
+    assert runner.cleaned_up.is_set()
+    assert [sample.idx for sample, _ in runner.calls] == ["pending"]
 
 
 @pytest.mark.parametrize(
