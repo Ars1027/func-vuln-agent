@@ -177,7 +177,8 @@ class SyntheticModel:
         return self
 
     async def ainvoke(self, messages):
-        func = next(m.content for m in messages if isinstance(m, HumanMessage))
+        data = next(m.content for m in messages if isinstance(m, HumanMessage))
+        func = json.loads(data)["source_code"]
         if func not in {COPY, CHECKED, UNKNOWN}:
             raise IntegrationError("synthetic_input_only", "脚本模型仅支持固定合成函数。")
         prediction = 1 if func == COPY else 0

@@ -1,7 +1,17 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
+
+from app.schemas.paths import normalize_snapshot_path
 
 Idx = StrictInt | StrictStr
 Mode = Literal["function_only", "rag_context", "conditions"]
@@ -72,16 +82,15 @@ class CodeLocation(Contract):
     end_line: Annotated[StrictInt, Field(ge=1)]
     content: str
 
+    @field_validator("path")
+    @classmethod
+    def valid_path(cls, path: str) -> str:
+        return normalize_snapshot_path(path)
+
     @model_validator(mode="after")
     def valid_location(self):
         if self.end_line < self.start_line:
             raise ValueError("end_line must be >= start_line")
-        # 模型可读取的位置不得暴露 Git 元数据，也不得越出当前快照。
-        parts = self.path.replace("\\", "/").split("/")
-        if any(p.casefold() in {"..", ".git"} for p in parts) or self.path.startswith(("/", "\\")):
-            raise ValueError("path must stay inside the snapshot, excluding .git")
-        if ":" in self.path:
-            raise ValueError("path must be relative")
         return self
 
 
@@ -167,6 +176,8 @@ class Report(AnalysisState):
 
 
 class RunConfig(Contract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     model: str = "unconfigured"
     temperature: float = 0
     max_output_tokens: int = Field(default=2048, ge=1)
@@ -175,7 +186,7 @@ class RunConfig(Contract):
     timeout_seconds: float = Field(default=120, gt=0)
     data_version: str | None = None
     index_version: str | None = None
-    prompt_version: str = "conditions-v1"
+    prompt_version: str = "conditions-v2"
 
 
 class Measurement(Contract):

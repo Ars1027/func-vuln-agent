@@ -1,8 +1,11 @@
+import asyncio
 import json
+import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from app.api import create_app
 from app.schemas.models import DetectionInput, Measurement, Report, RunConfig
 from app.schemas.ports import AnalysisError, IntegrationError, Services
@@ -30,8 +33,9 @@ class Exporter:
 
 
 class Runner:
-    def __init__(self, gate=None):
+    def __init__(self, gate=None, config=None):
         self.gate = gate
+        self.config = config or RunConfig()
         self.calls = []
 
     async def run(self, sample, mode, emit):
@@ -84,13 +88,13 @@ class Runner:
                 Measurement(
                     idx=sample.idx,
                     mode=mode,
-                    config=RunConfig(),
+                    config=self.config,
                     status="failed",
                 ),
             )
         return Report(
             idx=sample.idx,
-            prediction=1,
+            prediction=0 if sample.idx == "1" else 1,
             reason="Synthetic evidence.",
             hypotheses=[{"id": "h1", "statement": "overflow"}],
             conditions=[
@@ -112,13 +116,15 @@ class Runner:
                     "evidence_ids": ["e1"],
                 }
             ],
-        ), Measurement(idx=sample.idx, mode=mode, config=RunConfig(), status="completed")
+        ), Measurement(idx=sample.idx, mode=mode, config=self.config, status="completed")
 
 
-def app_for(path: Path, runner=None, config=None):
-    runner = runner or Runner()
-    preparation = Preparation()
-    app = create_app(Services(runner, preparation, Exporter(), config or RunConfig()), path)
+def app_for(path: Path, runner=None, config=None, preparation=None, **options):
+    runner = runner or Runner(config=config)
+    if config is not None:
+        runner.config = config
+    preparation = preparation or Preparation()
+    app = create_app(Services(runner, preparation, Exporter(), runner.config), path, **options)
     return app, runner, preparation
 
 
@@ -238,7 +244,10 @@ def test_batch_typed_ids_partial_failure_and_export_order(tmp_path):
         wait_status(client, good_id, "completed")
         result = client.get(f"/api/tasks/{good_id}/result.jsonl")
         assert result.status_code == 200
-        assert [json.loads(line)["idx"] for line in result.text.splitlines()] == [1, "1"]
+        assert [json.loads(line) for line in result.text.splitlines()] == [
+            {"idx": 1, "prediction": 1},
+            {"idx": "1", "prediction": 0},
+        ]
 
 
 def test_invalid_batch_rejected_before_preparation(tmp_path):
@@ -274,8 +283,6 @@ def test_invalid_batch_rejected_before_preparation(tmp_path):
 
 
 def test_restart_keeps_finished_and_active_analysis(tmp_path):
-    import asyncio
-
     db_path = tmp_path / "tasks.db"
     gate = asyncio.Event()
     app, _, _ = app_for(db_path, Runner(gate), RunConfig(model="original-model"))
@@ -319,8 +326,6 @@ def test_restart_keeps_finished_and_active_analysis(tmp_path):
 
 
 def test_live_sse_continues_from_snapshot_without_gap(tmp_path):
-    import asyncio
-
     gate = asyncio.Event()
     app, _, _ = app_for(tmp_path / "tasks.db", Runner(gate))
     with TestClient(app) as client:
@@ -383,9 +388,7 @@ def test_missing_task_and_unavailable_snapshot(tmp_path):
         assert response.json()["code"] == "adapter_unavailable"
 
 
-def test_preparation_timeout_and_unexpected_adapter_errors_are_recorded(tmp_path):
-    import asyncio
-
+def test_preparation_timeout_and_unexpected_adapter_errors_are_recorded(tmp_path, caplog):
     class SlowPreparation(Preparation):
         async def prepare_course(self, sample):
             await asyncio.sleep(1)
@@ -399,7 +402,8 @@ def test_preparation_timeout_and_unexpected_adapter_errors_are_recorded(tmp_path
 
     config = RunConfig(timeout_seconds=0.01)
     app = create_app(
-        Services(Runner(), SlowPreparation(), FailingExporter(), config), tmp_path / "tasks.db"
+        Services(Runner(config=config), SlowPreparation(), FailingExporter(), config),
+        tmp_path / "tasks.db",
     )
     with TestClient(app) as client:
         created = client.post(
@@ -458,3 +462,286 @@ def test_preparation_timeout_and_unexpected_adapter_errors_are_recorded(tmp_path
         assert export.status_code == 503
         assert export.json()["code"] == "internal_error"
         assert "private" not in export.text
+    assert "create_snapshot failed" in caplog.text
+    assert "export_result failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "test_api.py:" in caplog.text
+    assert "private adapter detail" not in caplog.text
+    assert "private export detail" not in caplog.text
+
+
+def submit_batch(client, ids):
+    rows = [{"idx": idx, "commit_url": "u", "target": 1, "func": "f"} for idx in ids]
+    return client.post(
+        "/api/batches", files={"file": ("x.jsonl", "\n".join(json.dumps(row) for row in rows))}
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["batches", "snapshots"])
+@pytest.mark.parametrize("field", ["idx", "func"])
+@pytest.mark.parametrize("in_place", [False, True])
+def test_preparation_preserves_original_idx_and_func(tmp_path, endpoint, field, in_place):
+    class ChangedPreparation(Preparation):
+        async def changed(self, value):
+            changed = {"idx": value.idx, "func": value.func, "snapshot_ref": "prepared"}
+            changed[field] = "1" if field == "idx" else "changed function"
+            if in_place:
+                setattr(value, field, changed[field])
+            await asyncio.sleep(0)
+            return DetectionInput(**changed)
+
+        prepare_course = changed
+        prepare_snapshot = changed
+
+    app, runner, _ = app_for(tmp_path / "tasks.db", preparation=ChangedPreparation())
+    with TestClient(app) as client:
+        if endpoint == "batches":
+            task_id = submit_batch(client, [1]).json()["task_id"]
+            failure = wait_status(client, task_id, "failed")["failures"][0]
+            measurement = client.get(f"/api/tasks/{task_id}/measurements").json()["measurements"][0]
+            assert measurement["model_calls"] == measurement["tool_calls"] == 0
+        else:
+            response = client.post(
+                "/api/snapshots",
+                json={"idx": 1, "func": "f", "commit_url": "u", "revision": "commit"},
+            )
+            assert response.status_code == 503
+            failure = response.json()
+        assert failure["code"] == "preparation_mismatch"
+        assert failure["idx"] == 1
+        assert runner.calls == []
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_measurement_elapsed_includes_preparation(tmp_path, monkeypatch, failed):
+    now = 0
+
+    class TimedPreparation(Preparation):
+        async def prepare_course(self, sample):
+            nonlocal now
+            now += 5
+            return await super().prepare_course(sample)
+
+    class TimedRunner(Runner):
+        async def run(self, sample, mode, emit):
+            nonlocal now
+            report, measurement = await super().run(sample, mode, emit)
+            now += 3
+            measurement = measurement.model_copy(
+                update={"elapsed_seconds": 1, "model_calls": 7, "tool_calls": 2}
+            )
+            if failed:
+                measurement.status = "failed"
+                raise AnalysisError("tool_failed", "Tool failed.", measurement)
+            return report, measurement
+
+    monkeypatch.setattr("app.api.service.time.perf_counter", lambda: now)
+    app, _, _ = app_for(tmp_path / "tasks.db", TimedRunner(), preparation=TimedPreparation())
+    with TestClient(app) as client:
+        task_id = submit_batch(client, [1]).json()["task_id"]
+        wait_status(client, task_id, "failed" if failed else "completed")
+        measurement = client.get(f"/api/tasks/{task_id}/measurements").json()["measurements"][0]
+        assert measurement["elapsed_seconds"] == 8
+        assert measurement["model_calls"] == 7
+        assert measurement["tool_calls"] == 2
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_mismatched_measurement_config_discards_untrusted_costs(tmp_path, failed):
+    class WrongMeasurementRunner(Runner):
+        async def run(self, sample, mode, emit):
+            report, measurement = await super().run(sample, mode, emit)
+            measurement = measurement.model_copy(
+                update={
+                    "config": RunConfig(model="wrong-model"),
+                    "model_calls": 99,
+                    "tool_calls": 99,
+                    "input_tokens": 99,
+                    "output_tokens": 99,
+                    "elapsed_seconds": 999,
+                    "status": "failed" if failed else "completed",
+                }
+            )
+            if failed:
+                raise AnalysisError("model_failed", "Model failed.", measurement)
+            return report, measurement
+
+    app, runner, _ = app_for(tmp_path / "tasks.db", WrongMeasurementRunner())
+    with TestClient(app) as client:
+        task_id = submit_batch(client, [1]).json()["task_id"]
+        wait_status(client, task_id, "failed")
+        measurement = client.get(f"/api/tasks/{task_id}/measurements").json()["measurements"][0]
+        assert measurement["config"] == runner.config.model_dump()
+        assert measurement["model_calls"] is None
+        assert measurement["tool_calls"] is None
+        assert measurement["input_tokens"] is None
+        assert measurement["output_tokens"] is None
+        assert measurement["elapsed_seconds"] < 999
+
+
+@pytest.mark.parametrize(
+    "operation", ["start", "start_sample", "finish_completed", "finish_failed", "complete"]
+)
+def test_storage_worker_failure_retains_results_and_joins_children(
+    tmp_path, monkeypatch, caplog, operation
+):
+    class CancellableRunner(Runner):
+        def __init__(self):
+            super().__init__()
+            self.cancelled_and_joined = False
+
+        async def run(self, sample, mode, emit):
+            result = await super().run(sample, mode, emit)
+            if sample.idx == "pending":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    await asyncio.sleep(0.01)
+                    self.cancelled_and_joined = True
+            return result
+
+    runner = Runner() if operation == "complete" else CancellableRunner()
+    app, _, _ = app_for(tmp_path / "tasks.db", runner, concurrency=3)
+    method = "finish_sample" if operation.startswith("finish_") else operation
+    original = getattr(app.state.store, method)
+    injected = False
+
+    def broken(*args):
+        nonlocal injected
+        if not injected and (method not in {"start_sample", "finish_sample"} or args[1] == 2):
+            injected = True
+            if operation == "finish_failed":
+                assert args[3].code == "tool_failed"
+            raise sqlite3.OperationalError("secret credential and function source")
+        return original(*args)
+
+    monkeypatch.setattr(app.state.store, method, broken)
+    with TestClient(app) as client:
+        last_idx = "bad" if operation == "finish_failed" else "broken"
+        task_id = submit_batch(client, ["done", "pending", last_idx]).json()["task_id"]
+        state = wait_status(client, task_id, "failed")
+        snapshot = client.get(f"/api/tasks/{task_id}/reports").json()
+        measurements = client.get(f"/api/tasks/{task_id}/measurements").json()["measurements"]
+        assert snapshot["active_samples"] == []
+        assert client.get(f"/api/tasks/{task_id}/result.jsonl").status_code == 409
+        if operation == "start":
+            assert state["completed"] == 0
+            assert len(state["failures"]) == 3
+            assert all(item["model_calls"] == 0 for item in measurements)
+        elif operation in {"start_sample", "finish_completed", "finish_failed"}:
+            assert state["completed"] == 1
+            assert snapshot["reports"][0]["idx"] == "done"
+            assert runner.cancelled_and_joined
+            assert snapshot["failed_samples"][0]["idx"] == "pending"
+            assert snapshot["failed_samples"][0]["trace"]
+            assert measurements[1]["model_calls"] is None
+            assert measurements[2]["model_calls"] == (0 if operation == "start_sample" else None)
+        else:
+            assert state["completed"] == 3
+            assert state["failures"] == []
+            assert len(snapshot["reports"]) == 3
+        stream = client.get(f"/api/tasks/{task_id}/events").text
+        assert "event: task_completed" in stream
+        if operation == "complete":
+            events = [
+                json.loads(line.removeprefix("data: "))
+                for line in stream.splitlines()
+                if line.startswith("data: ")
+            ]
+            error = next(event for event in events if event["type"] == "error")
+            assert error["idx"] is None
+            assert error["payload"]["code"] == "internal_error"
+    assert "run_task failed" in caplog.text
+    assert "OperationalError" in caplog.text
+    assert "secret credential and function source" not in caplog.text
+
+
+def test_unavailable_storage_abort_is_logged_and_restart_recovers(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "tasks.db"
+    app, _, _ = app_for(path)
+
+    def offline(*args):
+        raise sqlite3.OperationalError("private database detail")
+
+    monkeypatch.setattr(app.state.store, "start", offline)
+    monkeypatch.setattr(app.state.store, "abort", offline)
+    with TestClient(app) as client:
+        task_id = submit_batch(client, [1]).json()["task_id"]
+        for _ in range(100):
+            if "abort_task failed" in caplog.text:
+                break
+            time.sleep(0.01)
+        assert "abort_task failed" in caplog.text
+        assert client.get(f"/api/tasks/{task_id}").json()["status"] == "queued"
+    restarted, _, _ = app_for(path)
+    with TestClient(restarted) as client:
+        assert wait_status(client, task_id, "failed")["failures"][0]["code"] == "interrupted"
+    assert "private database detail" not in caplog.text
+
+
+def test_unexpected_sample_failure_logs_locations_without_details(tmp_path, caplog):
+    class BrokenRunner(Runner):
+        async def run(self, sample, mode, emit):
+            raise RuntimeError("secret model credential and code")
+
+    app, _, _ = app_for(tmp_path / "tasks.db", BrokenRunner())
+    with TestClient(app) as client:
+        task_id = submit_batch(client, [1]).json()["task_id"]
+        failure = wait_status(client, task_id, "failed")["failures"][0]
+        assert failure["code"] == "internal_error"
+    assert "run_sample failed" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert task_id in caplog.text
+    assert "test_api.py:" in caplog.text
+    assert "secret model credential and code" not in caplog.text
+
+
+async def test_sse_cleanup_preserves_other_subscribers_and_removes_empty_set(tmp_path):
+    app, _, _ = app_for(tmp_path / "tasks.db")
+    store = app.state.store
+    sample = DetectionInput(idx=1, func="f", snapshot_ref="s")
+    task_id = store.create([("direct", sample)], "conditions")
+    endpoint = next(route.endpoint for route in app.routes if route.path.endswith("/events"))
+
+    class ConnectedRequest:
+        async def is_disconnected(self):
+            return False
+
+    first = (await endpoint(task_id, ConnectedRequest(), 0, None)).body_iterator
+    second = (await endpoint(task_id, ConnectedRequest(), 0, None)).body_iterator
+    await anext(first)
+    await anext(second)
+    assert len(store.subscribers[task_id]) == 2
+    await first.aclose()
+    assert len(store.subscribers[task_id]) == 1
+    await second.aclose()
+    assert task_id not in store.subscribers
+    store.close()
+
+
+def test_batch_limits_reject_before_parsing_and_preparation(tmp_path):
+    row = json.dumps({"idx": 1, "commit_url": "u", "target": 1, "func": "f"})
+    app, runner, prep = app_for(
+        tmp_path / "tasks.db", max_batch_bytes=len(row.encode()), max_batch_samples=1
+    )
+    with TestClient(app) as client:
+        too_large = client.post(
+            "/api/batches", files={"file": ("x.jsonl", b"\xff" * (len(row.encode()) + 1))}
+        )
+        assert too_large.status_code == 413
+        assert too_large.json()["code"] == "batch_too_large"
+        assert prep.course_calls == runner.calls == []
+        task_id = client.post("/api/batches", files={"file": ("x.jsonl", row)}).json()["task_id"]
+        wait_status(client, task_id, "completed")
+    app, _, prep = app_for(tmp_path / "samples.db", max_batch_samples=1)
+    with TestClient(app) as client:
+        response = client.post("/api/batches", files={"file": ("x.jsonl", row + "\nnot json")})
+        assert response.status_code == 413
+        assert prep.course_calls == []
+
+
+@pytest.mark.parametrize("option", ["max_batch_bytes", "max_batch_samples"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_batch_limits_must_be_positive(tmp_path, option, value):
+    with pytest.raises(ValueError, match="batch limits"):
+        app_for(tmp_path / "tasks.db", **{option: value})

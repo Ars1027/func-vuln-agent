@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
+from app.diagnostics import log_failure
 from app.schemas.models import (
     ActiveSample,
     CourseSample,
@@ -33,6 +35,8 @@ from app.schemas.models import (
     idx_key,
 )
 from app.schemas.ports import AnalysisError, IntegrationError, Services
+
+logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
@@ -236,24 +240,21 @@ class TaskStore:
             self._event(task_id, "task_completed", {"status": status}, None)
         self._notify(task_id)
 
-    def recover(self) -> None:
-        rows = self.db.execute(
-            "SELECT id FROM tasks WHERE status IN ('queued', 'running')"
+    def abort(self, task_id: str, code: str, message: str) -> None:
+        """终止未完成样本，保留成功报告与已有分析。"""
+        task = self._task(task_id)
+        config = RunConfig.model_validate_json(task["config_json"])
+        unfinished = self.db.execute(
+            "SELECT position, idx_json, status FROM inputs WHERE task_id = ? "
+            "AND status IN ('queued', 'running') ORDER BY position",
+            (task_id,),
         ).fetchall()
-        for row in rows:
-            task_id = row["id"]
-            task = self._task(task_id)
-            config = RunConfig.model_validate_json(task["config_json"])
-            unfinished = self.db.execute(
-                "SELECT position, idx_json, status FROM inputs WHERE task_id = ? "
-                "AND status IN ('queued', 'running') ORDER BY position",
-                (task_id,),
-            ).fetchall()
+        with self.db:
             for item in unfinished:
                 failure = Failure(
                     idx=json.loads(item["idx_json"]),
-                    code="interrupted",
-                    message="Analysis was interrupted by service restart.",
+                    code=code,
+                    message=message,
                 )
                 measurement = Measurement(
                     idx=failure.idx,
@@ -265,7 +266,18 @@ class TaskStore:
                     elapsed_seconds=None if item["status"] == "running" else 0,
                 )
                 self.finish_sample(task_id, item["position"], None, failure, measurement)
-            self.complete(task_id)
+            self.db.execute("UPDATE tasks SET status = 'failed' WHERE id = ?", (task_id,))
+            if not unfinished:
+                self._event(task_id, "error", {"code": code, "message": message}, None)
+            self._event(task_id, "task_completed", {"status": "failed"}, None)
+        self._notify(task_id)
+
+    def recover(self) -> None:
+        rows = self.db.execute(
+            "SELECT id FROM tasks WHERE status IN ('queued', 'running')"
+        ).fetchall()
+        for row in rows:
+            self.abort(row["id"], "interrupted", "Analysis was interrupted by service restart.")
 
     def _task(self, task_id: str) -> sqlite3.Row:
         row = self.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -377,7 +389,7 @@ class TaskStore:
         }
 
 
-def _parse_batch(content: bytes) -> list[tuple[str, CourseSample]]:
+def _parse_batch(content: bytes, max_samples: int) -> list[tuple[str, CourseSample]]:
     try:
         source = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -387,6 +399,8 @@ def _parse_batch(content: bytes) -> list[tuple[str, CourseSample]]:
     for line_number, line in enumerate(source.splitlines(), 1):
         if not line.strip():
             continue
+        if len(rows) >= max_samples:
+            raise ApiError(413, "batch_too_large", "Batch has too many samples.")
         try:
             sample = CourseSample.model_validate_json(line)
         except ValidationError as exc:
@@ -403,9 +417,18 @@ def _parse_batch(content: bytes) -> list[tuple[str, CourseSample]]:
     return rows
 
 
-def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2) -> FastAPI:
+def create_app(
+    services: Services,
+    db_path: str | Path,
+    *,
+    concurrency: int = 2,
+    max_batch_bytes: int = 10 * 1024 * 1024,
+    max_batch_samples: int = 1000,
+) -> FastAPI:
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
+    if max_batch_bytes < 1 or max_batch_samples < 1:
+        raise ValueError("batch limits must be at least 1")
     store = TaskStore(db_path, services.config)
     semaphore = asyncio.Semaphore(concurrency)
     workers: set[asyncio.Task] = set()
@@ -420,6 +443,7 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
         async with semaphore:
             store.start_sample(task_id, position)
             idx = input_value.idx
+            original_func = input_value.func
             started = time.perf_counter()
             phase = "preparation" if kind == "course" else "analysis"
 
@@ -438,26 +462,34 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
                 store.append_analysis(task_id, position, event_type, payload)
 
             try:
-                sample = (
-                    await asyncio.wait_for(
-                        services.preparation.prepare_course(input_value),
-                        timeout=services.config.timeout_seconds,
+                if kind == "course":
+                    async with asyncio.timeout(services.config.timeout_seconds):
+                        sample = await services.preparation.prepare_course(input_value)
+                else:
+                    sample = input_value
+                if idx_key(sample.idx) != idx_key(idx) or sample.func != original_func:
+                    raise IntegrationError(
+                        "preparation_mismatch", "Prepared sample idx or function changed."
                     )
-                    if kind == "course"
-                    else input_value
-                )
-                if idx_key(sample.idx) != idx_key(idx):
-                    raise IntegrationError("preparation_mismatch", "Prepared sample idx changed.")
                 phase = "analysis"
                 report, measurement = await services.runner.run(sample, mode, emit)
                 if idx_key(report.idx) != idx_key(idx) or idx_key(measurement.idx) != idx_key(idx):
                     raise IntegrationError("report_mismatch", "Result idx changed during analysis.")
-                if measurement.mode != mode or measurement.status != "completed":
+                if (
+                    measurement.mode != mode
+                    or measurement.status != "completed"
+                    or measurement.config != services.config
+                ):
                     raise IntegrationError(
                         "measurement_mismatch", "Measurement does not match task."
                     )
+                measurement = measurement.model_copy(
+                    update={"elapsed_seconds": time.perf_counter() - started}
+                )
                 store.finish_sample(task_id, position, report, None, measurement)
             except asyncio.CancelledError:
+                raise
+            except sqlite3.Error:
                 raise
             except TimeoutError:
                 failure = (
@@ -476,22 +508,29 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
                     or idx_key(measurement.idx) != idx_key(idx)
                     or measurement.mode != mode
                     or measurement.status != "failed"
+                    or measurement.config != services.config
                 ):
                     measurement = failed_measurement()
+                else:
+                    measurement = measurement.model_copy(
+                        update={"elapsed_seconds": time.perf_counter() - started}
+                    )
                 store.finish_sample(task_id, position, None, failure, measurement)
-            except Exception:
+            except Exception as exc:
+                log_failure(logger, "run_sample", exc, task_id=task_id, idx=idx)
                 failure = Failure(idx=idx, code="internal_error", message="Analysis failed.")
                 store.finish_sample(task_id, position, None, failure, failed_measurement())
 
     async def run_task(
         task_id: str, rows: list[tuple[str, CourseSample | DetectionInput]], mode: Mode
     ) -> None:
-        store.start(task_id)
-        children = [
-            asyncio.create_task(run_sample(task_id, pos, kind, sample, mode))
-            for pos, (kind, sample) in enumerate(rows)
-        ]
+        children: list[asyncio.Task] = []
         try:
+            store.start(task_id)
+            children = [
+                asyncio.create_task(run_sample(task_id, pos, kind, sample, mode))
+                for pos, (kind, sample) in enumerate(rows)
+            ]
             await asyncio.gather(*children)
             store.complete(task_id)
         except asyncio.CancelledError:
@@ -499,6 +538,15 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
                 child.cancel()
             await asyncio.gather(*children, return_exceptions=True)
             raise
+        except Exception as exc:
+            log_failure(logger, "run_task", exc, task_id=task_id)
+            for child in children:
+                child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
+            try:
+                store.abort(task_id, "internal_error", "Task execution failed.")
+            except Exception as abort_exc:
+                log_failure(logger, "abort_task", abort_exc, task_id=task_id)
 
     def schedule(rows: list[tuple[str, CourseSample | DetectionInput]], mode: Mode) -> TaskView:
         task_id = store.create(rows, mode)
@@ -543,28 +591,31 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
     async def create_batch(
         file: UploadFile = File(...), mode: Mode = Form("conditions")
     ) -> TaskView:
-        return schedule(_parse_batch(await file.read()), mode)
+        content = await file.read(max_batch_bytes + 1)
+        if len(content) > max_batch_bytes:
+            raise ApiError(413, "batch_too_large", "Batch file is too large.")
+        return schedule(_parse_batch(content, max_batch_samples), mode)
 
     @app.post("/api/snapshots")
     async def create_snapshot(request: SnapshotRequest) -> DetectionInput:
+        idx, original_func = request.idx, request.func
         try:
-            sample = await asyncio.wait_for(
-                services.preparation.prepare_snapshot(request),
-                timeout=services.config.timeout_seconds,
-            )
-            if idx_key(sample.idx) != idx_key(request.idx):
-                raise IntegrationError("preparation_mismatch", "Prepared sample idx changed.")
+            async with asyncio.timeout(services.config.timeout_seconds):
+                sample = await services.preparation.prepare_snapshot(request)
+            if idx_key(sample.idx) != idx_key(idx) or sample.func != original_func:
+                raise IntegrationError(
+                    "preparation_mismatch", "Prepared sample idx or function changed."
+                )
             return sample
         except IntegrationError as exc:
-            raise ApiError(503, exc.code, exc.message, idx=request.idx) from exc
+            raise ApiError(503, exc.code, exc.message, idx=idx) from exc
         except TimeoutError as exc:
             raise ApiError(
-                503, "preparation_timeout", "Snapshot preparation timed out.", idx=request.idx
+                503, "preparation_timeout", "Snapshot preparation timed out.", idx=idx
             ) from exc
         except Exception as exc:
-            raise ApiError(
-                503, "internal_error", "Snapshot preparation failed.", idx=request.idx
-            ) from exc
+            log_failure(logger, "create_snapshot", exc, idx=idx)
+            raise ApiError(503, "internal_error", "Snapshot preparation failed.", idx=idx) from exc
 
     @app.get("/api/tasks/{task_id}")
     async def get_task(task_id: str) -> TaskView:
@@ -583,12 +634,15 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
 
     @app.get("/api/tasks/{task_id}/result.jsonl")
     async def export_result(task_id: str) -> PlainTextResponse:
-        ids, reports = store.export_data(task_id)
         try:
+            ids, reports = store.export_data(task_id)
             result = services.exporter.export(ids, reports)
+        except ApiError:
+            raise
         except IntegrationError as exc:
             raise ApiError(503, exc.code, exc.message, task_id=task_id) from exc
         except Exception as exc:
+            log_failure(logger, "export_result", exc, task_id=task_id)
             raise ApiError(503, "internal_error", "Result export failed.", task_id=task_id) from exc
         return PlainTextResponse(result, media_type="application/x-ndjson")
 
@@ -629,7 +683,11 @@ def create_app(services: Services, db_path: str | Path, *, concurrency: int = 2)
                         return
                     await wake.wait()
             finally:
-                store.subscribers[task_id].discard(wake)
+                subscribers = store.subscribers.get(task_id)
+                if subscribers is not None:
+                    subscribers.discard(wake)
+                    if not subscribers:
+                        store.subscribers.pop(task_id, None)
 
         return StreamingResponse(
             generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}

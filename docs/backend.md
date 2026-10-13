@@ -29,6 +29,8 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 
 配置清单见根目录 `.env.example`；通过终端设置环境变量，应用不会自动读取 `.env`。`FVA_MODEL` 使用所选模型服务的模型名，密钥仅在本机环境中保存。`OPENAI_BASE_URL` 可指定兼容服务。模型设置和预算由同一 `RunConfig` 提供给三组实验，调用重试不在服务内部隐式追加。无用量信息时 token 字段为 `null`。
 
+`RunConfig` 创建后不可修改。自定义 `Runner` 须暴露实际使用的 `config`；与 `Services` 配置不一致时装配失败，测量返回不同配置时样本执行失败。模型服务支持的 temperature 等参数仍须在实际提供方接入时核对。
+
 `app.main` 的缺失适配器明确返回错误；不会自动使用演示数据。接入后用自己的组合工厂构造 `AgentRunner` 和 `Services`，传给 `create_app`，无需修改检测循环。关闭外部 LangSmith tracing，避免课程函数经观测系统外发。
 
 ## 模块交接
@@ -45,7 +47,11 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 
 `POST /api/snapshots` 的请求为 `{idx, func, commit_url, revision}`，`revision` 必填，响应为可直接提交检测的 `{idx, func, snapshot_ref}`。单条检测增加可选 `mode`；批量表单字段名为 `file` 和 `mode`。课程 JSONL 暂只接受已确认的四字段，拿到数据后由 #1 核对扩展字段，而不是将未审查的字段传给模型。
 
+准备层不得改变输入的 `idx/func`，API 会核对返回值。默认每批上限为 10 MiB JSONL 内容和 1000 个样本，超限返回 413；可通过应用工厂的 `max_batch_bytes/max_batch_samples` 参数调整。multipart 解析可能先将上传内容暂存到磁盘，公开部署仍需入口层请求大小限制。
+
 仓库结果使用 `RepositoryResult(matches, scope)`，`scope` 记录符号解析或搜索范围。`CodeLocation` 为 `{snapshot_ref,path,start_line,end_line,content}`，行号从 1 起。当前函数通过 `locate_function` 建立可引用代码证据；工具返回的代码和历史材料由运行时分配证据 ID，模型只能引用这些 ID。
+
+Agent 与 `CodeLocation` 使用同一相对路径规则，统一分隔符并拒绝 `.GIT`、`.git.`、`.. ` 等歧义组件。真实仓库工具还必须校验解析链接后的最终路径位于快照内。历史案例按 `case_id` 复用证据，但同一 ID 的来源或正文冲突会明确失败。
 
 `IntegrationError(code, message)` 的消息必须适合向 API 用户展示，不含凭据或准备层标签。模型上下文不含准备层对象、`target`、`commit_url`、`revision`；工具 schema 不允许模型传入或改变快照引用。无真实适配器时不能验收其 Git/文件隔离实现。
 
@@ -59,11 +65,17 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 
 模型通过 `finish` 结束分析，预算耗尽或工具/模型失败返回执行失败；待确认条件不触发自动安全预测。历史证据不能独立支撑 `supported/refuted`。结构校验验证引用与来源；证据是否真正覆盖同一路径及最终二元判断仍由模型分析，需课程评测检验。
 
+提示词版本 `conditions-v2` 将原始函数放在 JSON 的 `source_code` 字段内，并明确其不具备指令权限。合成测试验证消息封装及工具权限，不代表真实模型已免疫提示词注入。未提出漏洞假设时，条件列表仍允许为空，不强制编造条件或固定工具调用。
+
+API 测量的 `elapsed_seconds` 包含准备与分析，成功和失败使用相同口径，不包括排队、结果落库和导出。直接调用 `AgentRunner.run` 时只测量分析阶段。
+
 ## 状态、SSE 与恢复
 
 任务、事件、报告、失败和测量保存到 SQLite。默认正式库 `artifacts/tasks.sqlite3`，演示库 `artifacts/demo-tasks.sqlite3`，均受 Git 忽略。状态变更和事件序号在同一事务提交，报告读取返回一致的 `seq`。前端先获取 `/reports`，再连接 `/events?after_seq={seq}`；查询参数优先于 `Last-Event-ID`。终止事件重放后连接结束。
 
 每个样本独立模型会话，批量并发由 `FVA_CONCURRENCY` 控制。批量部分失败仍保留成功报告，整体为 `failed`。导出只接受全量成功任务，按输入顺序交给 #7 适配器，不用 0 补齐失败项。
+
+后台任务发生未处理异常时，先取消并等待同批未完成的子任务，再尝试记录失败状态；已经完成的报告保留。若数据库持续不可写，失败状态可能暂时无法落库，修复存储后重启服务，由中断恢复流程收尾。意外异常日志包含操作、任务/样本标识、异常类型和调用栈位置，不输出异常消息、源码或局部变量；API 继续返回简化错误。
 
 重启时尚处于 `queued/running` 的任务标记为失败，未完成样本记为中断；保留已完成报告和已有分析记录。失败后的部分分析在 `/reports` 的 `failed_samples` 返回，不列为 `active_samples`；前端按原类型 `idx` 关联 `failures`。中断的运行中样本无法恢复的调用次数和耗时记为 `null`，仍在排队而未开始的样本记为 0，配置保留任务创建时的值。不会自动重放模型调用；重新提交原始单条请求或 JSONL 会创建新任务。修改模型或实验配置后也应创建新任务。
 

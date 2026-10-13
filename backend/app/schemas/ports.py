@@ -61,6 +61,8 @@ class ResultExporter(Protocol):
 
 
 class Runner(Protocol):
+    config: RunConfig
+
     async def run(
         self,
         sample: DetectionInput,
@@ -77,7 +79,9 @@ class Services:
         exporter: ResultExporter,
         config: RunConfig,
     ):
+        if config != runner.config:
+            raise ValueError("service and runner must use the same RunConfig")
         self.runner = runner
         self.preparation = preparation
         self.exporter = exporter
-        self.config = config
+        self.config = runner.config
