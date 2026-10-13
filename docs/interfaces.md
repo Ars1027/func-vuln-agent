@@ -62,6 +62,8 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 
 创建任务返回 `task_id`，状态为 `queued`、`running`、`completed`、`failed`。批量任务保留已完成报告，含失败项时返回失败状态。
 
+单条请求的 JSON 顶层及批量请求的 multipart 表单均接受可选 `mode`：`function_only`（函数基线）、`rag_context`（课程基础方案）、`conditions`（条件方案，默认值）。`mode` 属于运行配置，由服务选择工具与提示词，不加入样本内容；未知值返回参数错误。任务状态响应回传实际 `mode`，供评测核对。
+
 错误使用 `code`、`message`，按上下文关联 `task_id`、`idx`。具体 HTTP 响应随 #5 实现补充。
 
 ## 5. 证据与条件
@@ -79,6 +81,8 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 | `evidence_ids` | 引用报告中已有证据的标识列表 |
 | `reason` | 状态判断或证据缺口的简述 |
 
+报告条件统一表述为漏洞成立所需的命题。RAG 的 `safety_conditions` 用于引导反证查询，不直接作为同极性的报告条件。例如报告条件为“复制长度可超过剩余容量”，当前路径上的有效长度检查是反驳它的证据；`supported` 始终表示支持漏洞条件。
+
 `supported/refuted` 必须有当前快照的代码证据；待测函数本身也可作为代码证据，由准备层定位。`unknown` 可包含已有片段及尚未解决的问题。历史类比用于提出假设，不单独证明待测条件成立。
 
 条件和假设可随新证据更新。排除一个假设不等于证明函数整体安全，最终判断按 [检测方法](method.md)综合解释。
@@ -87,11 +91,15 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 
 事件类型为 `task_status`、`retrieval`、`repository_read`、`condition_update`、`sample_completed`、`error`、`task_completed`。SSE 的 `event` 为类型，`data` 为 JSON。
 
-公共字段：`task_id`、`seq`、`timestamp`、`type`、`payload`；样本事件含 `idx`。`seq` 在任务内递增。重连后通过状态与报告接口恢复界面。
+公共字段：`task_id`、`seq`、`timestamp`、`type`、`payload`；样本事件含 `idx`。`seq` 在任务内递增，SSE 的 `id` 使用该序号。
+
+报告接口返回 `{task_id, seq, reports, active_samples, failures}`，是截至 `seq` 的一致状态快照。`reports` 为成功完成的完整报告；`active_samples` 包含运行中样本的 `idx`、当前 `hypotheses/conditions/evidence/trace`，尚无最终 `prediction`。任务仍可查询期间，事件接口支持 `after_seq`（首次连接默认 0）或 `Last-Event-ID`，先重放该序号之后的事件，再连续推送新事件；两者同时提供时以 `after_seq` 为准。
+
+初次加载或重连时，UI 读取报告快照，再从其 `seq` 订阅事件。UI 只应用比本地已应用序号更新的事件；迟到且 `seq` 更小的快照不覆盖当前状态。这样可恢复进行中的分析，并避免重连时回滚状态。
 
 - 检索事件：查询、案例标识和来源摘要。
 - 仓库事件：工具、参数、路径/行号和结果摘要。
-- 条件事件：本次变化的 `hypotheses`、`conditions` 和所引用的 `evidence` 项；UI 按 id 更新。
+- 条件事件：本次变化的 `hypotheses`、`conditions` 和所引用的 `evidence` 项；UI 先按 `task_id`、原类型的 `idx` 定位样本，再在各列表内按 `id` 更新。不同样本可使用相同局部 ID，整数 `1` 与字符串 `"1"` 不合并。
 - 完成/错误事件：报告关联或失败原因。
 
 展示操作、证据与判断摘要。最终报告提供完整状态，供界面重新加载。
@@ -108,6 +116,6 @@ Web 单样本输入函数与修复提交链接，明确选择“该提交”或�
 
 ## 8. 实验配置与测量
 
-#5 提供函数基线、课程基础方案和条件方案三种实验配置，由 #7 在运行层选择，不作为待测样本字段输入模型。正式 Web/Bot 使用完整条件方案。
+#5 提供函数基线、课程基础方案和条件方案三种实验配置，#7 通过创建任务时的 `mode` 选择，并核对响应中的实际模式。正式 Web/Bot 使用 `conditions`。
 
 每次运行记录模式、模型与解码设置、数据/索引版本、运行预算、工具调用次数、token 用量、耗时和执行状态。服务未返回的用量标为缺失。测量信息单独保存，课程导出保持两字段格式。
