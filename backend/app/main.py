@@ -1,4 +1,4 @@
-"""Composition root for a local, single-user service."""
+"""本地单用户服务的组件装配入口。"""
 
 import os
 from pathlib import Path

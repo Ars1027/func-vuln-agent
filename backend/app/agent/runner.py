@@ -1,4 +1,4 @@
-"""LangGraph model/tool loop for a single prepared function and snapshot."""
+"""针对准备好的单个函数及其快照，执行 LangGraph 模型与工具调用循环。"""
 
 import asyncio
 import json
@@ -35,42 +35,42 @@ class _GraphState(TypedDict):
 
 @tool
 def search_cases(query: str, limit: int = 5) -> str:
-    """Find relevant historical vulnerability and repair cases by query."""
+    """根据查询检索相关的历史漏洞及修复案例。"""
     raise NotImplementedError
 
 
 @tool
 def search_code(query: str) -> str:
-    """Search code in the current repository snapshot for a text pattern."""
+    """在当前仓库快照的代码中搜索指定文本模式。"""
     raise NotImplementedError
 
 
 @tool
 def read_file(path: str, start_line: int, end_line: int) -> str:
-    """Read a line range in a file from the current repository snapshot."""
+    """读取当前仓库快照中指定文件的行区间。"""
     raise NotImplementedError
 
 
 @tool
 def find_symbol(symbol: str) -> str:
-    """Find a symbol's definition or call sites in the current repository snapshot."""
+    """在当前仓库快照中查找符号的定义或调用位置。"""
     raise NotImplementedError
 
 
 @tool
 def update_conditions(hypotheses: list[Hypothesis], conditions: list[Condition]) -> str:
-    """Add or revise hypotheses and required conditions using existing evidence IDs."""
+    """引用已有证据 ID，新增或修订漏洞假设及其成立所需的条件。"""
     raise NotImplementedError
 
 
 @tool
 def finish(prediction: int, reason: str) -> str:
-    """Finish with binary prediction and an evidence-based explanation of unresolved questions."""
+    """输出二元预测，并依据证据解释尚未解决的问题，结束分析。"""
     raise NotImplementedError
 
 
 def openai_model_factory(config: RunConfig) -> ChatOpenAI:
-    """Create the production model; credentials are read by ChatOpenAI."""
+    """创建实际检测使用的模型，凭据由 ChatOpenAI 读取。"""
     if config.model == "unconfigured":
         raise ValueError("model is unconfigured")
     return ChatOpenAI(
@@ -116,7 +116,7 @@ def _prompt(mode: Mode) -> str:
 
 
 class AgentRunner:
-    """Create with Repository, optional Retriever, model factory, and shared RunConfig."""
+    """使用仓库接口、可选检索器、模型工厂和共享运行配置创建分析器。"""
 
     def __init__(
         self,

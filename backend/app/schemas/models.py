@@ -34,7 +34,7 @@ class DetectionRequest(DetectionInput):
 
 
 class CourseSample(Contract):
-    """Preparation/evaluation only; never pass this object to the model."""
+    """仅用于数据准备与评测，不得将此对象传给模型。"""
 
     idx: Idx
     commit_url: NonEmpty
@@ -64,7 +64,7 @@ class HistoricalCase(Contract):
 
 
 class CodeLocation(Contract):
-    """Adapter guarantees that content is verbatim in this single snapshot."""
+    """适配器保证内容来自当前单版本快照，且与原文一致。"""
 
     snapshot_ref: NonEmpty
     path: NonEmpty
@@ -76,7 +76,7 @@ class CodeLocation(Contract):
     def valid_location(self):
         if self.end_line < self.start_line:
             raise ValueError("end_line must be >= start_line")
-        # Model-readable locations cannot expose Git metadata or escape the snapshot.
+        # 模型可读取的位置不得暴露 Git 元数据，也不得越出当前快照。
         parts = self.path.replace("\\", "/").split("/")
         if any(p.casefold() in {"..", ".git"} for p in parts) or self.path.startswith(("/", "\\")):
             raise ValueError("path must stay inside the snapshot, excluding .git")
@@ -224,5 +224,5 @@ class TaskView(Contract):
 
 
 def idx_key(idx: Idx) -> tuple[type, int | str]:
-    """JSON integer 1 and string '1' identify different samples."""
+    """JSON 整数 1 与字符串 '1' 表示不同的样本标识。"""
     return type(idx), idx

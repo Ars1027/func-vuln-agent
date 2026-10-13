@@ -1,1 +1,1 @@
-"""Single-function vulnerability detection service."""
+"""单函数漏洞检测服务。"""

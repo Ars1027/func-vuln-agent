@@ -1,4 +1,4 @@
-"""Offline synthetic integration fixture. Never used by the real app.main factory."""
+"""用于离线集成测试的合成样例，正式入口 app.main 的工厂不会使用此模块。"""
 
 import json
 import os
@@ -38,7 +38,7 @@ HELPER = (
 COMMIT_URL = "https://example.invalid/synthetic/commit/001"
 UNKNOWN_URL = "https://example.invalid/synthetic/commit/002"
 
-# Neutral opaque references, identical file paths across versions.
+# 使用不携带标签语义的不透明引用，不同版本使用相同文件路径。
 SOURCES = {
     "s-a83f": {"src/copy.c": COPY},
     "s-592b": {"src/copy.c": CHECKED, "src/helper.c": HELPER},
@@ -47,7 +47,7 @@ SOURCES = {
 
 
 class SyntheticAdapters:
-    """Fixed in-memory fixtures, not a Git client, index or course exporter."""
+    """固定的内存合成样例，不实现真实 Git 客户端、索引或课程结果导出。"""
 
     async def prepare_course(self, sample: CourseSample) -> DetectionInput:
         return await self.prepare_snapshot(
@@ -157,7 +157,7 @@ class SyntheticAdapters:
         ][:limit]
 
     def export(self, input_ids: Sequence[Idx], reports: Sequence[Report]) -> str:
-        # The API checks completeness and orders reports before calling this fixture.
+        # API 在调用此合成适配器前检查结果完整性，并按输入顺序排列报告。
         by_id = {idx_key(report.idx): report for report in reports}
         return "".join(
             json.dumps({"idx": idx, "prediction": by_id[idx_key(idx)].prediction}) + "\n"
@@ -166,7 +166,7 @@ class SyntheticAdapters:
 
 
 class SyntheticModel:
-    """Deterministic tool script for three exact fixtures, explicitly not an LLM."""
+    """仅用于三个固定样例的确定性工具调用脚本，不是真实大语言模型。"""
 
     def __init__(self):
         self.tools = set()

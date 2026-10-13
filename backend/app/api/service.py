@@ -1,4 +1,4 @@
-"""Local, single-process detection API with durable task and event state."""
+"""本地单进程检测 API，持久化保存任务及事件状态。"""
 
 import asyncio
 import json
@@ -60,8 +60,8 @@ class TaskStore:
     def __init__(self, db_path: str | Path, config: RunConfig):
         if str(db_path) != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        # The app factory may run outside the ASGI lifespan thread (as in TestClient).
-        # All store operations remain on the single ASGI event loop.
+        # 应用工厂可能在 ASGI 生命周期线程之外运行，例如使用 TestClient 时。
+        # 所有存储操作仍在同一个 ASGI 事件循环中执行。
         self.db = sqlite3.connect(str(db_path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
@@ -293,7 +293,7 @@ class TaskStore:
         )
 
     def reports(self, task_id: str) -> ReportsSnapshot:
-        # No await between reads: the single ASGI loop cannot mutate state mid-snapshot.
+        # 多次读取之间没有 await，同一个 ASGI 事件循环不会在快照读取途中修改状态。
         with self.db:
             task = self._task(task_id)
             rows = self.db.execute(

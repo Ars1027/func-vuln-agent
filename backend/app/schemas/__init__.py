@@ -1,1 +1,1 @@
-"""Shared contracts owned by the integration lead."""
+"""由组长负责维护的共享接口约定。"""

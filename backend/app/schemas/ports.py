@@ -1,4 +1,4 @@
-"""Integration seams; real adapters remain with the owners of #2, #3, #4 and #7."""
+"""模块集成接口；真实适配器由 #2、#3、#4 和 #7 的负责人实现。"""
 
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Protocol

@@ -1,4 +1,4 @@
-"""Explicit missing adapters until the owning members integrate #2/#3/#4/#7."""
+"""在对应负责人接入 #2/#3/#4/#7 前，显式报告适配器缺失。"""
 
 from collections.abc import Sequence
 from typing import NoReturn
@@ -21,7 +21,7 @@ def unavailable(module: str) -> NoReturn:
 
 
 class UnavailableAdapters:
-    """Never silently substitute demo data in the real service."""
+    """正式服务缺少适配器时明确报错，不自动使用演示数据替代。"""
 
     async def prepare_course(self, sample: CourseSample) -> DetectionInput:
         unavailable("课程版本准备模块（#3）")
