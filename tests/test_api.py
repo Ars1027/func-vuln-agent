@@ -251,6 +251,26 @@ def test_batch_typed_ids_partial_failure_and_export_order(tmp_path):
         ]
 
 
+@pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_batch_preserves_unicode_separators_in_functions(tmp_path, separator, newline):
+    app, runner, _ = app_for(tmp_path / "tasks.db")
+    functions = [f"void f() {{ /* before{separator}after */ }}", "void g() {}"]
+    rows = [
+        {"idx": idx, "commit_url": "u", "target": 1, "func": func}
+        for idx, func in enumerate(functions)
+    ]
+    body = newline.join(json.dumps(row, ensure_ascii=False) for row in rows) + newline
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/batches", files={"file": ("samples.jsonl", body.encode("utf-8"))}
+        )
+        assert response.status_code == 202
+        state = wait_status(client, response.json()["task_id"], "completed")
+        assert state["completed"] == 2
+        assert {sample.idx: sample.func for sample, _ in runner.calls} == dict(enumerate(functions))
+
+
 def test_invalid_batch_rejected_before_preparation(tmp_path):
     app, _, prep = app_for(tmp_path / "tasks.db")
     with TestClient(app) as client:

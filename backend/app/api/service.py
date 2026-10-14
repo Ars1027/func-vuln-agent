@@ -396,7 +396,7 @@ def _parse_batch(content: bytes, max_samples: int) -> list[tuple[str, CourseSamp
         raise ApiError(422, "invalid_jsonl", "Batch file must be UTF-8 JSONL.") from exc
     rows: list[tuple[str, CourseSample]] = []
     seen: set[tuple[type, int | str]] = set()
-    for line_number, line in enumerate(source.splitlines(), 1):
+    for line_number, line in enumerate(source.split("\n"), 1):
         if not line.strip():
             continue
         if len(rows) >= max_samples:
