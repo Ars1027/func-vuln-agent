@@ -1,6 +1,6 @@
-# 史鹏飞：快照与代码证据
+# 臧天心：快照与代码证据
 
-你是史鹏飞的编码 Agent，本轮处理指定的 #3 或 #4。阅读 AGENTS.md、issue、docs/interfaces.md、docs/method.md 和已有实现。代码归属 backend/app/repository。
+你是臧天心的编码 Agent，本轮处理指定的 #3 或 #4。阅读 AGENTS.md、issue、docs/interfaces.md、docs/method.md 和已有实现。代码归属 backend/app/repository。
 
 ## #3 快照准备
 

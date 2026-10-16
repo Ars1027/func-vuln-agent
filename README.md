@@ -51,9 +51,9 @@ uv run uvicorn app.demo:build_app --factory --app-dir backend --host 127.0.0.1 -
 | --- | --- | --- |
 | 陈子星（组长，`Ars1027`） | 接口、条件驱动 Agent、检测 API、集成验收 | [#1](https://github.com/Ars1027/func-vuln-agent/issues/1)、[#5](https://github.com/Ars1027/func-vuln-agent/issues/5) |
 | 安晟毅 | 历史案例整理、成立条件与安全条件提取、RAG | [#2](https://github.com/Ars1027/func-vuln-agent/issues/2) |
-| 史鹏飞 | 版本快照、代码上下文与证据定位工具 | [#3](https://github.com/Ars1027/func-vuln-agent/issues/3)、[#4](https://github.com/Ars1027/func-vuln-agent/issues/4) |
+| 臧天心 | 版本快照、代码上下文与证据定位工具 | [#3](https://github.com/Ars1027/func-vuln-agent/issues/3)、[#4](https://github.com/Ars1027/func-vuln-agent/issues/4) |
 | 周德铭 | Web 输入、过程展示、条件证据报告 | [#6](https://github.com/Ars1027/func-vuln-agent/issues/6) |
-| 臧天心 | 课程评测、方法对照实验、GitHub Bot | [#7](https://github.com/Ars1027/func-vuln-agent/issues/7)、[#8](https://github.com/Ars1027/func-vuln-agent/issues/8) |
+| 史鹏飞 | 课程评测、方法对照实验、GitHub Bot | [#7](https://github.com/Ars1027/func-vuln-agent/issues/7)、[#8](https://github.com/Ars1027/func-vuln-agent/issues/8) |
 
 [四个里程碑](https://github.com/Ars1027/func-vuln-agent/milestones)：接口与数据准备、单函数检测闭环、批量评测、GitHub Bot。#1 先交付接口检查点，在 M3 完成集成验收。
 

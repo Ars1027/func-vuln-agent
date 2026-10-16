@@ -40,9 +40,9 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 | 负责人 / Issue | 接入协议 | 关键保证 |
 | --- | --- | --- |
 | 安晟毅 #2 | `Retriever.search_cases(query, limit)` | 只搜索课程历史数据；无匹配为空列表，故障抛 `IntegrationError`；条件关联来源和片段 |
-| 史鹏飞 #3 | `Preparation.prepare_course/prepare_snapshot` | 返回 `DetectionInput`，去掉标签、提交及选版语义；函数与快照一致 |
-| 史鹏飞 #3/#4 | `Repository.locate_function/search_code/read_file/find_symbol` | 仅当前快照；返回原文和相对位置；拒绝越界路径、Git 元数据及其他版本；快照引用及路径不携带标签 |
-| 臧天心 #7 | `ResultExporter.export(input_ids, reports)` | 输出仅有 `idx/prediction` 的完整有序 JSONL；保留标识类型 |
+| 臧天心 #3 | `Preparation.prepare_course/prepare_snapshot` | 返回 `DetectionInput`，去掉标签、提交及选版语义；函数与快照一致 |
+| 臧天心 #3/#4 | `Repository.locate_function/search_code/read_file/find_symbol` | 仅当前快照；返回原文和相对位置；拒绝越界路径、Git 元数据及其他版本；快照引用及路径不携带标签 |
+| 史鹏飞 #7 | `ResultExporter.export(input_ids, reports)` | 输出仅有 `idx/prediction` 的完整有序 JSONL；保留标识类型 |
 | 周德铭 #6 | HTTP、SSE、`ReportsSnapshot` | 初始快照加 seq 续接，样本内 ID 更新，不合并整数和字符串 idx |
 
 `POST /api/snapshots` 的请求为 `{idx, func, commit_url, revision}`，`revision` 必填，响应为可直接提交检测的 `{idx, func, snapshot_ref}`。单条检测增加可选 `mode`；批量表单字段名为 `file` 和 `mode`。课程 JSONL 暂只接受已确认的四字段，拿到数据后由 #1 核对扩展字段，而不是将未审查的字段传给模型。

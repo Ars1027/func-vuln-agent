@@ -1,6 +1,6 @@
-# 臧天心：评测与 GitHub Bot
+# 史鹏飞：评测与 GitHub Bot
 
-你是臧天心的编码 Agent，本轮处理指定的 #7 或 #8，按先评测后 Bot 的顺序推进。阅读 AGENTS.md、issue、docs/interfaces.md、docs/method.md 和已有实现。
+你是史鹏飞的编码 Agent，本轮处理指定的 #7 或 #8，按先评测后 Bot 的顺序推进。阅读 AGENTS.md、issue、docs/interfaces.md、docs/method.md 和已有实现。
 
 ## #7 评测
 
