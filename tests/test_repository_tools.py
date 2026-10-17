@@ -659,6 +659,23 @@ async def test_symbol_storage_class_and_initializer_are_classified(tmp_path, dec
     assert f"a.cpp:{line} {kind}" in result.scope
 
 
+@pytest.mark.parametrize(
+    ("declaration", "kind"),
+    [("int needle;", "definition"), ("extern int needle;", "declaration")],
+)
+async def test_numeric_separators_do_not_hide_end_of_function_scope(tmp_path, declaration, kind):
+    func = "int f() { int n = 1'000; return n; }"
+    source = f"{func}\n{declaration}\nconstexpr int b = 2'000;\n"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": source}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+    )
+    result = await adapters.find_symbol(prepared.snapshot_ref, "needle")
+    assert len(result.matches) == 1
+    assert f"a.cpp:2 {kind}" in result.scope
+
+
 @pytest.mark.parametrize("prefix", [" " * 20_000, '"' + r"\a" * 10_000 + '" '])
 def test_symbol_context_checks_cancellation_during_long_scan(prefix):
     import re

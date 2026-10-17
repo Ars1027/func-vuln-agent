@@ -749,3 +749,81 @@ async def test_named_return_type_keeps_following_declaration_boundary(tmp_path, 
     )
     previous_location = await adapters.locate_function(prepared.snapshot_ref, previous)
     assert previous_location.content == previous
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("1'000", "2'000"),
+        ("0xff'aa", "0xab'cd"),
+        ("0b1010'0101", "0b0011'1100"),
+        ("01'234", "05'670"),
+        ("1'000.5'000", "2'000.7'000"),
+        (".1'000e+1'0", ".2'000e-1'0"),
+        ("0x1'ab.cp+1'0", "0x2'cd.ep-1'0"),
+        ("1'000ULL", "2'000ULL"),
+        ("1\\\n'000", "2'\\\r\n000"),
+    ],
+)
+@pytest.mark.parametrize("course", [False, True])
+async def test_numeric_separators_do_not_hide_current_function(tmp_path, before, after, course):
+    func = "int f() { return 0; }"
+    source = f"constexpr auto a = {before};\n{func}\nconstexpr auto b = {after};\n"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    if course:
+        prepared = await adapters.prepare_course(
+            CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+        )
+    else:
+        prepared = await adapters.prepare_snapshot(
+            SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+        )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == before.count("\n") + 2
+    assert location.content == func
+    result = await adapters.search_code(prepared.snapshot_ref, "return 0;")
+    assert result.matches == [location]
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["' '", "L' '", "u' '", "U' '", "u8' '", '"1\'000 x"', 'R"tag(1\'000 x)tag"'],
+)
+async def test_numeric_separators_keep_literal_whitespace_and_code_layout(tmp_path, literal):
+    func = f"int f() {{ auto n = 1'000; auto c = {literal}; return n; }}"
+    body = func.replace(" auto ", "\n auto ").replace(" return ", "\n return ")
+    source = f"constexpr auto a = 2'000;\n{body}\nconstexpr auto b = 3'000;\n"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.content == body
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(
+                idx=1,
+                func=func.replace(literal, literal.replace(" ", "\t")),
+                commit_url=COMMIT_URL,
+                revision="commit",
+            )
+        )
+    assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize("literal", ["u8'a'", "u\\\n8'a'", "u\\\r\n8'a'", "u8\\\n'a'"])
+async def test_numeric_tokens_do_not_consume_prefixed_character_literals(tmp_path, literal):
+    func = "int f() { return 0; }"
+    source = f"constexpr auto a = {literal};\n{func}\nconstexpr auto b = u8'b';\n"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == literal.count("\n") + 2
+    assert location.content == func

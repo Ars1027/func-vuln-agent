@@ -45,12 +45,19 @@ _TYPE_PREFIX_ENDINGS = frozenset("=(),;{}!|<>?:~^+-/%")
 _SCOPE_OPENERS = re.compile(r"\b(?:namespace|class|struct|union|enum)\b")
 _RANK = {"definition": 0, "macro": 0, "declaration": 1, "call": 2, "reference": 3}
 _LINE_SPLICE = r"\\\r?\n"
+_PP_NUMBER = (
+    rf"(?<![\w.])(?:[0-9]|\.(?:{_LINE_SPLICE})*[0-9])"
+    rf"(?:(?:{_LINE_SPLICE})*(?:[eEpP](?:{_LINE_SPLICE})*[+-]|[\w.]|'(?:{_LINE_SPLICE})*\w))*"
+)
 _LEXEMES = re.compile(
     # C/C++ 先拼接反斜线换行；直接匹配原文，以保留物理行号和偏移。
     rf"(?P<comment>/(?:{_LINE_SPLICE})*(?:(?P<line_comment>/(?:{_LINE_SPLICE}|[^\n])*)|"
     rf"\*[\s\S]*?(?:\*(?:{_LINE_SPLICE})*/|$)))|"
     r"""(?:u8|u|U|L)?R"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"|"""
-    r""""(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'"""
+    # 先消费完整 pp-number，避免数字分隔符配对成跨越函数的字符字面量。
+    rf"(?P<number>{_PP_NUMBER})|"
+    r""""(?:\\[\s\S]|[^"\\])*"|"""
+    rf"(?:(?:u(?:{_LINE_SPLICE})*8|[uUL])(?:{_LINE_SPLICE})*)?'(?:\\[\s\S]|[^'\\])*'"
 )
 _DECLARATION_TOKENS = re.compile(
     _LEXEMES.pattern
@@ -84,6 +91,7 @@ def normalize_whitespace(
         in_literal = (
             lexeme is not None
             and lexeme.group("comment") is None
+            and lexeme.group("number") is None
             and lexeme.start() <= offset < lexeme.end()
         )
         if preserve_line_comments and character == "\n" and offset == line_comment_end:
@@ -439,9 +447,8 @@ def _symbol_contexts(
     non_global = 0
     index = 0
     line_start = 0
-    quote: str | None = None
-    line_comment = False
-    block_comment = False
+    lexemes = _LEXEMES.finditer(text)
+    lexeme = next(lexemes, None)
     next_cancel_check = 0
     for match in matches:
         check_scan_cancelled(cancel_event)
@@ -449,32 +456,19 @@ def _symbol_contexts(
             if cancel_event is not None and index >= next_cancel_check:
                 check_scan_cancelled(cancel_event)
                 next_cancel_check = index + 4096
+            while lexeme is not None and lexeme.end() <= index:
+                lexeme = next(lexemes, None)
+            if lexeme is not None and lexeme.start() <= index < lexeme.end():
+                end = min(lexeme.end(), match.start())
+                newline = text.rfind("\n", index, end)
+                if newline != -1:
+                    line_start = newline + 1
+                index = end
+                continue
             character = text[index]
             if character == "\n":
                 line_start = index + 1
-            if line_comment:
-                if character == "\n":
-                    line_comment = False
-            elif block_comment:
-                if text.startswith("*/", index):
-                    block_comment = False
-                    index += 1
-            elif quote is not None:
-                if character == "\\":
-                    if text[index + 1 : index + 2] == "\n":
-                        line_start = index + 2
-                    index += 1
-                elif character == quote:
-                    quote = None
-            elif text.startswith("//", index):
-                line_comment = True
-                index += 1
-            elif text.startswith("/*", index):
-                block_comment = True
-                index += 1
-            elif character in "'\"":
-                quote = character
-            elif character == "{":
+            if character == "{":
                 local = _opener_kind(text, index) != "scope"
                 stack.append(local)
                 non_global += local
@@ -497,10 +491,20 @@ def _looks_like_declaration(prefix: str) -> bool:
     return tokens[-1] not in _IDENTIFIER_KEYWORDS
 
 
+def _mask_non_code(text: str) -> str:
+    """屏蔽注释与字符串/字符内容，保留数值代码及原始偏移。"""
+    return _LEXEMES.sub(
+        lambda match: (
+            match.group() if match.group("number") is not None else " " * len(match.group())
+        ),
+        text,
+    )
+
+
 def _has_variable_initializer(after: str) -> bool:
     """跳过当前声明符的数组维度，只在其后判断初始化，避免混入同句的其他变量。"""
     depth = 0
-    for character in _LEXEMES.sub(" ", after):
+    for character in _mask_non_code(after):
         if character == "[":
             depth += 1
         elif character == "]":
@@ -533,7 +537,7 @@ def _direct_extern_initializer(header: str) -> bool:
 def _variable_prefix(text: str, offset: int) -> str:
     """只在有界窗口内回溯当前声明，跨过初始化列表但不跨越作用域边界。"""
     source = text[max(0, offset - CLASSIFY_LOOKAHEAD) : offset]
-    prefix = _LEXEMES.sub(lambda match: " " * len(match.group()), source)
+    prefix = _mask_non_code(source)
     index = len(prefix) - 1
     while index >= 0:
         if prefix[index] in ";{":
@@ -580,7 +584,7 @@ def _classify(text: str, offset: int, symbol: str, *, global_scope: bool, line_s
                 return "definition"
         prefix = text[max(line_start, offset - 200) : offset]
         return "declaration" if _looks_like_declaration(prefix) else "call"
-    stripped = _LEXEMES.sub(" ", after).lstrip()
+    stripped = _mask_non_code(after).lstrip()
     if stripped[:1] in {"=", ";", "[", "{", ","} and global_scope:
         prefix = _variable_prefix(text, offset)
         if re.search(r"\bextern\b", prefix) and not _has_variable_initializer(after):
