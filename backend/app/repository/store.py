@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import threading
-import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -87,19 +86,17 @@ class SnapshotStore:
         root: str | Path,
         *,
         max_total_bytes: int | None = 2 * 1024**3,
-        min_idle_seconds: float = 600.0,
     ) -> None:
         self.root = Path(root)
         self.snapshots = self.root / "snapshots"
         self.refs = self.root / "refs"
         self.temp = self.root / "tmp"
         self.max_total_bytes = max_total_bytes
-        self.min_idle_seconds = min_idle_seconds
         self._publish_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
-        # 配额计算与回收必须跨引用串行，否则并发发布可能互相删除刚发布的快照。
+        # 引用没有到期/释放协议，已发布快照可能仍被排队或运行中的任务使用。
+        # 配额不足时拒绝新发布，不通过删除已发放的证据来腾出空间。
         self._quota_lock = threading.Lock()
-        self._reserved_bytes = 0
 
     def ref_for(self, repo_url: str, commit: str) -> str:
         digest = hashlib.sha256(f"{repo_url}\n{commit}".encode()).hexdigest()[:16]
@@ -154,17 +151,19 @@ class SnapshotStore:
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
             size = _directory_size(staged)
-            self._reserve_quota(size, keep=snapshot_ref)
-            try:
+            # 配额检查、登记和可见性切换共用一把锁，不重复统计在途预留。
+            with self._quota_lock:
+                if (
+                    self.max_total_bytes is not None
+                    and self._snapshot_bytes() + size > self.max_total_bytes
+                ):
+                    raise IntegrationError("storage_quota_exceeded", "快照存储配额已用尽。")
                 self._write_metadata(snapshot_ref, repo_url, commit)
                 try:
                     os.replace(staged, destination)
                 except OSError as exc:
+                    (self.refs / f"{snapshot_ref}.json").unlink(missing_ok=True)
                     raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
-            except BaseException:
-                self._release_quota(size)
-                raise
-            self._release_quota(size)
 
     def _publish_lock(self, snapshot_ref: str) -> threading.Lock:
         with self._locks_guard:
@@ -180,43 +179,6 @@ class SnapshotStore:
         except OSError as exc:
             temporary.unlink(missing_ok=True)
             raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
-
-    def _reserve_quota(self, size: int, *, keep: str) -> None:
-        """跨引用串行地预留空间；只回收空闲足够久的快照，避免误删使用中的树。"""
-        if self.max_total_bytes is None:
-            return
-        with self._quota_lock:
-            total = self._snapshot_bytes() + self._reserved_bytes
-            if total + size > self.max_total_bytes and self.refs.is_dir():
-                entries = sorted(
-                    (path for path in self.refs.glob("snap-*.json")),
-                    key=lambda path: path.stat().st_mtime,
-                )
-                now = time.time()
-                for ref_file in entries:
-                    if total + size <= self.max_total_bytes:
-                        break
-                    snapshot_ref = ref_file.stem
-                    if snapshot_ref == keep:
-                        continue
-                    try:
-                        idle = now - ref_file.stat().st_mtime
-                    except OSError:
-                        continue
-                    if idle < self.min_idle_seconds:
-                        continue
-                    tree = self.snapshots / snapshot_ref
-                    freed = _directory_size(tree)
-                    shutil.rmtree(tree, ignore_errors=True)
-                    ref_file.unlink(missing_ok=True)
-                    total -= freed
-            if total + size > self.max_total_bytes:
-                raise IntegrationError("storage_quota_exceeded", "快照存储配额已用尽。")
-            self._reserved_bytes += size
-
-    def _release_quota(self, size: int) -> None:
-        with self._quota_lock:
-            self._reserved_bytes = max(0, self._reserved_bytes - size)
 
     def _snapshot_bytes(self) -> int:
         if not self.refs.is_dir():
@@ -242,7 +204,7 @@ class SnapshotStore:
     def read_text(self, path: Path) -> str:
         raw = self._read_bytes(path)
         try:
-            return raw.decode("utf-8")
+            return raw.decode("utf-8").replace("\r\n", "\n")
         except UnicodeDecodeError as exc:
             raise IntegrationError("file_unreadable", "该文件不是 UTF-8 文本。") from exc
 
@@ -251,7 +213,7 @@ class SnapshotStore:
             raw = path.read_bytes()
         except OSError as exc:
             raise IntegrationError("file_unreadable", "无法读取该文件。") from exc
-        if b"\x00" in raw[:8192]:
+        if b"\x00" in raw:
             raise IntegrationError("file_unreadable", "该文件不是文本文件。")
         return raw
 
@@ -262,21 +224,24 @@ class SnapshotStore:
         end_line: int,
         *,
         max_lines: int,
+        max_bytes: int = 2 * 1024 * 1024,
     ) -> tuple[list[str], int, bool]:
         """只读取请求的行区间；返回 (行内容, 实际结束行, 是否提前遇到文件末尾)。"""
         try:
+            if path.stat().st_size > max_bytes:
+                raise IntegrationError("file_too_large", f"单文件读取上限为 {max_bytes} 字节。")
             raw = path.open("rb")
         except OSError as exc:
             raise IntegrationError("file_unreadable", "无法读取该文件。") from exc
         with raw:
             try:
-                head = raw.read(8192)
+                while chunk := raw.read(8192):
+                    if b"\x00" in chunk:
+                        raise IntegrationError("file_unreadable", "该文件不是文本文件。")
             except OSError as exc:
                 raise IntegrationError("file_unreadable", "无法读取该文件。") from exc
-            if b"\x00" in head:
-                raise IntegrationError("file_unreadable", "该文件不是文本文件。")
             raw.seek(0)
-            stream = io.TextIOWrapper(raw, encoding="utf-8")
+            stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n")
             try:
                 for _ in range(start_line - 1):
                     if not stream.readline():
@@ -287,7 +252,7 @@ class SnapshotStore:
                     line = stream.readline()
                     if not line:
                         break
-                    lines.append(line.rstrip("\r\n"))
+                    lines.append(line.removesuffix("\r\n").removesuffix("\n"))
             except UnicodeDecodeError as exc:
                 raise IntegrationError("file_unreadable", "该文件不是 UTF-8 文本。") from exc
         if not lines:
@@ -323,14 +288,14 @@ class SnapshotStore:
                     continue
                 if not path.is_file() or path.is_symlink():
                     continue
+                if stat.st_size > max_bytes:
+                    if report is not None:
+                        report.oversized.append(relative)
+                    continue
                 suffix = path.suffix.lower()
                 if suffix not in suffixes and not (suffix == "" and _looks_like_source(path)):
                     if report is not None:
                         report.excluded += 1
-                    continue
-                if stat.st_size > max_bytes:
-                    if report is not None:
-                        report.oversized.append(relative)
                     continue
                 try:
                     text = self.read_text(path)
@@ -351,7 +316,8 @@ class SnapshotStore:
 def _looks_like_source(path: Path, preview_bytes: int = 4096) -> bool:
     """无扩展名文件是否像 C/C++ 头文件（含预处理指令）。"""
     try:
-        head = path.read_bytes()[:preview_bytes]
+        with path.open("rb") as stream:
+            head = stream.read(preview_bytes)
     except OSError:
         return False
     if b"\x00" in head:

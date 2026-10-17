@@ -311,3 +311,91 @@ async def test_tools_reject_snapshot_refs_from_outside(snapshot, tool):
     with pytest.raises(IntegrationError) as unknown:
         await getattr(adapters, tool)("snap-" + "f" * 16, *argument)
     assert unknown.value.code == "snapshot_not_found"
+
+
+async def test_read_file_enforces_bytes_even_for_one_long_line(tmp_path):
+    fake = FakeGit({REPO: {COMMIT: {"a.c": "int f(void) { return 1; }\n", "long.c": "x" * 1000}}})
+    adapters = RepositoryAdapters(
+        tmp_path / "storage", git=fake, resolver=public_resolver, max_file_bytes=100
+    )
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func="int f(void) { return 1; }",
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.read_file(prepared.snapshot_ref, "long.c", 1, 1)
+    assert failure.value.code == "file_too_large"
+
+
+@pytest.mark.parametrize("separator", ["\f", "\v", "\r", "\u0085", "\u2028", "\u2029"])
+async def test_location_and_file_reads_use_the_same_lf_lines(tmp_path, separator):
+    func = "int f(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": f"/* before{separator}still same line */\n{func}\n"}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    read = await adapters.read_file(prepared.snapshot_ref, "a.c", 2, 2)
+    assert location.start_line == location.end_line == 2
+    assert location.content == read.matches[0].content == func
+
+
+async def test_symbol_ranking_keeps_calls_and_declarations_after_references(tmp_path):
+    from app.repository.locate import find_symbol
+
+    func = "int entry(void) { return 1; }"
+    text = "/* needle */\n/* needle */\nvoid needle(void);\nvoid caller(void) { needle(); }\n"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": text + func}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    result = find_symbol(adapters.store, prepared.snapshot_ref, "needle", limit=2)
+    assert [match.start_line for match in result.matches] == [3, 4]
+    assert "a.c:3 declaration" in result.scope and "a.c:4 call" in result.scope
+
+
+async def test_symbol_scopes_are_scanned_once_even_after_count_cap(tmp_path, monkeypatch):
+    from app.repository import locate
+
+    func = "int entry(void) { return 1; }"
+    text = "namespace N {\n" + "int capacity;\n" * 1000 + "}\n" + func
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": text}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    original = locate._opener_kind
+    openings = []
+
+    def count_opener(source, offset):
+        openings.append(offset)
+        return original(source, offset)
+
+    monkeypatch.setattr(locate, "_opener_kind", count_opener)
+    result = locate.find_symbol(
+        adapters.store, prepared.snapshot_ref, "capacity", max_occurrences=3
+    )
+    assert len(openings) == 1
+    assert "3+ occurrence(s)" in result.scope
+    assert "definition" in result.scope

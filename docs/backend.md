@@ -49,6 +49,9 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 
 `POST /api/snapshots` 的请求为 `{idx, func, commit_url, revision}`，`revision` 必填，响应为可直接提交检测的 `{idx, func, snapshot_ref}`。单条检测增加可选 `mode`；批量表单字段名为 `file` 和 `mode`。课程 JSONL 暂只接受已确认的四字段，拿到数据后由 #1 核对扩展字段，而不是将未审查的字段传给模型。
 
+快照准备中的链接格式或托管主机参数错误（`unsupported_commit_url`、`unsupported_host`）返回
+HTTP 422；DNS、网络、依赖与准备超时等执行失败返回 503，保留各自的 `code/message`。
+
 准备层不得改变输入的 `idx/func`，API 会核对返回值。默认每批上限为 10 MiB JSONL 内容和 1000 个样本，超限返回 413；可通过应用工厂的 `max_batch_bytes/max_batch_samples` 参数调整。multipart 解析可能先将上传内容暂存到磁盘，公开部署仍需入口层请求大小限制。
 
 仓库结果使用 `RepositoryResult(matches, scope)`，`scope` 记录符号解析或搜索范围。`CodeLocation` 为 `{snapshot_ref,path,start_line,end_line,content}`，行号从 1 起。当前函数通过 `locate_function` 建立可引用代码证据；工具返回的代码和历史材料由运行时分配证据 ID，模型只能引用这些 ID。

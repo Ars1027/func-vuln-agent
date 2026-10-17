@@ -114,6 +114,10 @@ class RepositoryPreparation:
 
     def _local_snapshot(self, target: CommitTarget, revision: str) -> str | None:
         """只用本地镜像与已发布快照；缺少对象时返回 None 交给联网路径。"""
+        if revision == "commit" and len(target.commit) == 40:
+            snapshot_ref = self.store.ref_for(target.repo_url, target.commit)
+            if self.store.exists(snapshot_ref):
+                return snapshot_ref
         handle = self.git.local_mirror(target.repo_url)
         if handle is None:
             return None

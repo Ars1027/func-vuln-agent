@@ -611,7 +611,8 @@ def create_app(
                 )
             return sample
         except IntegrationError as exc:
-            raise ApiError(503, exc.code, exc.message, idx=idx) from exc
+            status = 422 if exc.code in {"unsupported_commit_url", "unsupported_host"} else 503
+            raise ApiError(status, exc.code, exc.message, idx=idx) from exc
         except TimeoutError as exc:
             raise ApiError(
                 503, "preparation_timeout", "Snapshot preparation timed out.", idx=idx

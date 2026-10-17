@@ -142,7 +142,19 @@ def test_git_subprocess_uses_security_options_and_scrubbed_env(tmp_path, monkeyp
 
 @pytest.mark.parametrize(
     "raw",
-    [b"a\\b.c", b"../a.c", b"a//b.c", b"/abs.c", b"a/.git/config", b"\xff.c"],
+    [
+        b"a\\b.c",
+        b"../a.c",
+        b"a//b.c",
+        b"/abs.c",
+        b"a/.git/config",
+        b"\xff.c",
+        b"x.c.",
+        b"x.c ",
+        b"dir./x.c",
+        b"dir /x.c",
+        b"x:y.c",
+    ],
 )
 def test_export_rejects_ambiguous_paths(raw):
     from app.repository.gitclient import _relative_path
@@ -158,3 +170,155 @@ def test_transport_is_hardened_against_redirects_and_non_https(tmp_path):
     assert "protocol.https.allow=always" in client.options
     assert "credential.helper=" in client.options
     assert "protocol.file.allow=always" not in client.options
+
+
+def make_repository(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "synthetic@example.invalid")
+    _git(repo, "config", "user.name", "synthetic")
+    return repo
+
+
+def test_abbreviated_non_tip_commit_is_found_by_bounded_deepening(tmp_path):
+    repo = make_repository(tmp_path)
+    commits = []
+    for value in range(3):
+        (repo / "a.c").write_text(f"int value = {value};\n", encoding="utf-8")
+        commits.append(_commit(repo, str(value)))
+    client = SubprocessGitClient(
+        tmp_path / "mirrors", max_fetch_depth=3, allow_local_transport=True
+    )
+    handle = client.fetch(str(repo), commits[0][:10])
+    assert client.resolve(handle, commits[0][:10]) == commits[0]
+
+
+def test_abbreviation_outside_fetch_depth_is_not_declared_absent(tmp_path):
+    repo = make_repository(tmp_path)
+    (repo / "a.c").write_text("int first;\n", encoding="utf-8")
+    first = _commit(repo, "first")
+    (repo / "a.c").write_text("int second;\n", encoding="utf-8")
+    _commit(repo, "second")
+    client = SubprocessGitClient(
+        tmp_path / "mirrors", max_fetch_depth=1, allow_local_transport=True
+    )
+    with pytest.raises(IntegrationError) as failure:
+        client.fetch(str(repo), first[:10])
+    assert failure.value.code == "commit_lookup_limited"
+    handle = client.fetch(str(repo), first)
+    assert client.resolve(handle, first) == first
+
+
+def test_fetch_rolls_back_an_oversized_mirror(tmp_path):
+    import random
+
+    repo = make_repository(tmp_path)
+    (repo / "large.bin").write_bytes(random.Random(42).randbytes(200_000))
+    commit = _commit(repo, "large synthetic blob")
+    client = SubprocessGitClient(
+        tmp_path / "mirrors", max_total_bytes=64_000, allow_local_transport=True
+    )
+    with pytest.raises(IntegrationError) as failure:
+        client.fetch(str(repo), commit)
+    assert failure.value.code == "storage_quota_exceeded"
+    assert client.local_mirror(str(repo)) is None
+    assert list(client.mirror_root.iterdir()) == []
+
+
+def test_tree_file_limit_stops_consuming_the_pipe(tmp_path, monkeypatch):
+    import io
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    records = b"".join(b"100644 blob " + b"1" * 40 + f"\tf{i}.c\0".encode() for i in range(10_000))
+    stream = io.BytesIO(records)
+
+    @contextmanager
+    def fake_stream(*args, **kwargs):
+        yield SimpleNamespace(stdout=stream, wait=lambda: 0)
+
+    client = SubprocessGitClient(tmp_path / "mirrors", max_files=1)
+    monkeypatch.setattr(client, "_stream_process", fake_stream)
+    with pytest.raises(IntegrationError) as failure:
+        client._tree_entries(tmp_path / "handle", "1" * 40)
+    assert failure.value.code == "snapshot_too_large"
+    assert stream.tell() <= 4096 < len(records)
+
+
+@pytest.mark.parametrize("paths", [(b"a.c", b"A.c"), (b"dir/a.c", b"DIR/b.c")])
+def test_export_rejects_case_aliases_before_overwriting(tmp_path, monkeypatch, paths):
+    repo = make_repository(tmp_path)
+    (repo / "a.c").write_text("int a;\n", encoding="utf-8")
+    commit = _commit(repo, "source")
+    client = SubprocessGitClient(tmp_path / "mirrors", allow_local_transport=True)
+    handle = client.fetch(str(repo), commit)
+    sha = _git(repo, "rev-parse", "HEAD:a.c")
+    monkeypatch.setattr(client, "_tree_entries", lambda *a, **kw: [(sha, path) for path in paths])
+    with pytest.raises(IntegrationError) as failure:
+        client.export(handle, commit, tmp_path / "exported")
+    assert failure.value.code == "snapshot_export_failed"
+    assert (tmp_path / "exported" / paths[0].decode()).read_text(encoding="utf-8") == "int a;\n"
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_blocked_stream_reads_stop_the_process_tree(tmp_path, cancelled):
+    import sys
+    import threading
+    import time
+
+    class PythonProcessClient(SubprocessGitClient):
+        @property
+        def options(self):
+            return ()
+
+    client = PythonProcessClient(
+        tmp_path / "mirrors", executable=sys.executable, timeout_seconds=5 if cancelled else 0.15
+    )
+    cancel = threading.Event()
+    timer = threading.Timer(0.15, cancel.set)
+    if cancelled:
+        timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(IntegrationError) as failure:
+            # 子进程继承 stdout；仅杀父进程会让 read 再等 10 秒。
+            with client._stream_process(
+                [
+                    "-c",
+                    (
+                        "import subprocess, sys, time; "
+                        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
+                        "time.sleep(10)"
+                    ),
+                ],
+                cancel_event=cancel,
+            ) as process:
+                process.stdout.read()
+        assert failure.value.code == (
+            "repository_cancelled" if cancelled else "repository_fetch_timeout"
+        )
+        assert time.monotonic() - started < 3
+    finally:
+        timer.cancel()
+
+
+def test_running_fetch_checks_quota_before_reading_more_output(tmp_path, monkeypatch):
+    mirror = tmp_path / "mirrors" / "working.git"
+    mirror.mkdir(parents=True)
+    client = SubprocessGitClient(mirror.parent, max_total_bytes=10)
+
+    class GrowingProcess(_FakeProcess):
+        def communicate(self, timeout=None):
+            if self.returncode == -9:
+                return "", ""
+            (mirror / "pack").write_bytes(b"x" * 20)
+            raise subprocess.TimeoutExpired(self.command, timeout)
+
+    process = GrowingProcess([])
+    monkeypatch.setattr("app.repository.gitclient.subprocess.Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(client, "_kill_process", lambda proc: setattr(proc, "returncode", -9))
+    with pytest.raises(IntegrationError) as failure:
+        client._execute(["fetch"], quota_path=mirror)
+    assert failure.value.code == "storage_quota_exceeded"
+    assert process.returncode == -9

@@ -105,6 +105,6 @@ def test_real_factory_never_silently_uses_demo(tmp_path, monkeypatch):
                 "revision": "commit",
             },
         )
-        assert response.status_code == 503
+        assert response.status_code == 422
         # 真实准备层按允许的托管主机校验链接，不再回退到演示数据。
         assert response.json()["code"] == "unsupported_host"

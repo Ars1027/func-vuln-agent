@@ -42,15 +42,28 @@ _TRAILING_QUALIFIERS = re.compile(
 _TYPE_PREFIX_ENDINGS = frozenset("=(),;{}!|<>?:~^+-/%")
 _SCOPE_OPENERS = re.compile(r"\b(?:namespace|class|struct|union|enum)\b")
 _RANK = {"definition": 0, "macro": 0, "declaration": 1, "call": 2, "reference": 3}
+_LEXEMES = re.compile(
+    r"""//[^\n]*|/\*[\s\S]*?(?:\*/|$)|"""
+    r"""(?:u8|u|U|L)?R"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"|"""
+    r""""(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'"""
+)
+CLASSIFY_LOOKAHEAD = 400
 
 
 def normalize_whitespace(text: str) -> tuple[str, list[int]]:
-    """折叠空白并保留归一化字符到原文偏移的映射。"""
+    """只折叠字面量外的空白，保留字符、字符串和原始字符串的内容及偏移。"""
     characters: list[str] = []
     offsets: list[int] = []
     previous_space = False
+    literals = (
+        match for match in _LEXEMES.finditer(text) if not match.group().startswith(("//", "/*"))
+    )
+    literal = next(literals, None)
     for offset, character in enumerate(text):
-        if character.isspace():
+        while literal is not None and offset >= literal.end():
+            literal = next(literals, None)
+        in_literal = literal is not None and literal.start() <= offset < literal.end()
+        if character.isspace() and not in_literal:
             if previous_space:
                 continue
             characters.append(" ")
@@ -77,7 +90,7 @@ def _expand_lines(text: str, start: int, end: int) -> tuple[int, int, str]:
     """把匹配偏移扩展为完整行区间，保证内容与原文逐行一致。"""
     start_line = _line_number(text, start)
     end_line = _line_number(text, max(end - 1, start))
-    lines = text.splitlines()
+    lines = text.replace("\r\n", "\n").split("\n")
     return start_line, end_line, "\n".join(lines[start_line - 1 : end_line])
 
 
@@ -128,8 +141,10 @@ def locate_function(
         if detail:
             detail = f"（{detail}）"
         raise IntegrationError(
-            "function_not_found",
-            f"当前函数与指定版本快照不一致，快照中找不到该函数{detail}。",
+            "function_scan_limit" if scan.oversized else "function_not_found",
+            f"源码扫描超出大小上限，无法确认待测函数的位置{detail}。"
+            if scan.oversized
+            else f"当前函数与指定版本快照不一致，快照中找不到该函数{detail}。",
         )
     return found[0]
 
@@ -196,7 +211,7 @@ class SymbolMatch:
 def _matching_paren(text: str, start: int) -> int:
     depth = 0
     index = start
-    while index < len(text):
+    while index < min(len(text), start + CLASSIFY_LOOKAHEAD):
         if text[index] == "(":
             depth += 1
         elif text[index] == ")":
@@ -222,41 +237,52 @@ def _opener_kind(text: str, index: int) -> str:
     return "block"
 
 
-def _enclosing_scopes(text: str, offset: int) -> list[str]:
-    """用轻量状态机判断符号所在作用域，忽略注释与字符串中的花括号。"""
-    stack: list[str] = []
+def _symbol_contexts(
+    text: str, matches: Iterator[re.Match]
+) -> Iterator[tuple[re.Match, bool, int]]:
+    """按符号位置向前扫描一次，避免对每次出现重新扫描整个文件前缀。"""
+    stack: list[bool] = []
+    non_global = 0
     index = 0
+    line_start = 0
     quote: str | None = None
     line_comment = False
     block_comment = False
-    while index < offset:
-        character = text[index]
-        if line_comment:
+    for match in matches:
+        while index < match.start():
+            character = text[index]
             if character == "\n":
-                line_comment = False
-        elif block_comment:
-            if text.startswith("*/", index):
-                block_comment = False
+                line_start = index + 1
+            if line_comment:
+                if character == "\n":
+                    line_comment = False
+            elif block_comment:
+                if text.startswith("*/", index):
+                    block_comment = False
+                    index += 1
+            elif quote is not None:
+                if character == "\\":
+                    if text[index + 1 : index + 2] == "\n":
+                        line_start = index + 2
+                    index += 1
+                elif character == quote:
+                    quote = None
+            elif text.startswith("//", index):
+                line_comment = True
                 index += 1
-        elif quote is not None:
-            if character == "\\":
+            elif text.startswith("/*", index):
+                block_comment = True
                 index += 1
-            elif character == quote:
-                quote = None
-        elif text.startswith("//", index):
-            line_comment = True
+            elif character in "'\"":
+                quote = character
+            elif character == "{":
+                local = _opener_kind(text, index) != "scope"
+                stack.append(local)
+                non_global += local
+            elif character == "}" and stack:
+                non_global -= stack.pop()
             index += 1
-        elif text.startswith("/*", index):
-            block_comment = True
-            index += 1
-        elif character in "'\"":
-            quote = character
-        elif character == "{":
-            stack.append(_opener_kind(text, index))
-        elif character == "}" and stack:
-            stack.pop()
-        index += 1
-    return stack
+        yield match, non_global == 0, line_start
 
 
 def _looks_like_declaration(prefix: str) -> bool:
@@ -272,17 +298,12 @@ def _looks_like_declaration(prefix: str) -> bool:
     return tokens[-1] not in _IDENTIFIER_KEYWORDS
 
 
-def _line_text(text: str, offset: int) -> str:
-    start = text.rfind("\n", 0, offset) + 1
-    end = text.find("\n", offset)
-    return text[start : len(text) if end == -1 else end]
-
-
-def _classify(text: str, offset: int, symbol: str) -> str:
-    line = _line_text(text, offset)
-    if re.match(rf"\s*#\s*define\s+{re.escape(symbol)}(?![A-Za-z0-9_])", line):
+def _classify(text: str, offset: int, symbol: str, *, global_scope: bool, line_start: int) -> str:
+    if offset - line_start < 200 and re.fullmatch(
+        rf"\s*#\s*define\s+{re.escape(symbol)}", text[line_start : offset + len(symbol)]
+    ):
         return "macro"
-    after = text[offset + len(symbol) :]
+    after = text[offset + len(symbol) : offset + len(symbol) + CLASSIFY_LOOKAHEAD]
     match = re.match(r"\s*\(", after)
     if match:
         close = _matching_paren(text, offset + len(symbol) + match.end() - 1)
@@ -292,14 +313,11 @@ def _classify(text: str, offset: int, symbol: str) -> str:
                 _TRAILING_QUALIFIERS.match(rest) and ";" not in rest.split("{", 1)[0]
             ):
                 return "definition"
-        line_start = text.rfind("\n", 0, offset) + 1
         prefix = text[max(line_start, offset - 200) : offset]
         return "declaration" if _looks_like_declaration(prefix) else "call"
     stripped = text[offset + len(symbol) : offset + len(symbol) + 40].lstrip()
-    if stripped[:1] in {"=", ";", "["}:
-        scopes = _enclosing_scopes(text, offset)
-        if all(scope == "scope" for scope in scopes):
-            return "definition"
+    if stripped[:1] in {"=", ";", "["} and global_scope:
+        return "definition"
     return "reference"
 
 
@@ -318,9 +336,7 @@ def find_symbol(
         raise IntegrationError("invalid_symbol", "符号名称必须是单个 C/C++ 标识符。")
     pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])")
     report = ScanReport()
-    definitions: list[SymbolMatch] = []
-    others: list[SymbolMatch] = []
-    total = 0
+    buckets: dict[int, list[SymbolMatch]] = {rank: [] for rank in set(_RANK.values())}
     counted = 0
     scanned_bytes = 0
     count_truncated = False
@@ -330,14 +346,17 @@ def find_symbol(
         if scanned_bytes > scan_byte_budget:
             scan_truncated = True
             break
-        for match in pattern.finditer(entry.text):
-            total += 1
+        for match, global_scope, line_start in _symbol_contexts(
+            entry.text, pattern.finditer(entry.text)
+        ):
             if counted >= max_occurrences:
                 count_truncated = True
             else:
                 counted += 1
-            kind = _classify(entry.text, match.start(), symbol)
-            bucket = definitions if kind in {"definition", "macro"} else others
+            kind = _classify(
+                entry.text, match.start(), symbol, global_scope=global_scope, line_start=line_start
+            )
+            bucket = buckets[_RANK[kind]]
             if len(bucket) >= limit:
                 continue
             start_line, end_line, content = _expand_lines(entry.text, match.start(), match.end())
@@ -353,17 +372,20 @@ def find_symbol(
                     kind=kind,
                 )
             )
-    definitions.sort(key=lambda item: (item.location.path, item.location.start_line))
-    others.sort(key=lambda item: (_RANK[item.kind], item.location.path, item.location.start_line))
-    selected = (definitions + others)[:limit]
+    candidates = [item for bucket in buckets.values() for item in bucket]
+    candidates.sort(
+        key=lambda item: (_RANK[item.kind], item.location.path, item.location.start_line)
+    )
+    selected = candidates[:limit]
     summary = ", ".join(
         f"{item.location.path}:{item.location.start_line} {item.kind}" for item in selected[:8]
     )
     scope = (
         f"text-level identifier scan over {report.scanned} C/C++ files; "
-        f"{total}{'+' if count_truncated or scan_truncated else ''} occurrence(s), "
+        f"{counted}{'+' if count_truncated or scan_truncated else ''} occurrence(s), "
         f"returning {len(selected)}; order: definitions/macros, declarations, calls, other "
-        "references; classification by parenthesis and brace heuristics, comments and strings "
+        f"references; classification by parenthesis and brace heuristics with {CLASSIFY_LOOKAHEAD}"
+        "-character lookahead, comments and strings "
         "are not excluded, not a compiler AST"
     )
     if count_truncated:
@@ -372,7 +394,7 @@ def find_symbol(
         scope += f"; scan stopped after {scan_byte_budget} bytes"
     if summary:
         scope += f"; matches: {summary}"
-    if total > len(selected):
+    if counted > len(selected) or count_truncated:
         scope += f" (truncated by limit {limit})"
     skipped = report.note()
     if skipped:

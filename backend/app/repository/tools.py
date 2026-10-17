@@ -93,6 +93,7 @@ class RepositoryTools:
             start_line,
             end_line,
             max_lines=self.max_read_lines,
+            max_bytes=self.max_file_bytes,
         )
         content = "\n".join(lines)
         scope = f"lines {start_line}-{actual_end} in {relative}"

@@ -293,3 +293,63 @@ def test_commit_url_variants_share_the_same_repo_target():
         target = parse_commit_url(url)
         assert target.repo_url == REPO
         assert target.commit == COMMIT
+
+
+async def test_cached_full_commit_survives_mirror_eviction_offline(tmp_path):
+    fake = build_fake()
+    adapters = build_adapters(tmp_path, fake)
+    sample = CourseSample(idx=1, commit_url=COMMIT_URL, target=0, func=CHECKED_FUNC)
+    first = await adapters.prepare_course(sample)
+    fake.fetched.clear()
+
+    def offline(_host):
+        pytest.fail("a materialized commit snapshot needs neither DNS nor the mirror")
+
+    adapters.preparation.resolver = offline
+    second = await adapters.prepare_course(sample)
+    assert second.snapshot_ref == first.snapshot_ref
+    assert len(fake.exported) == 1
+
+
+@pytest.mark.parametrize(
+    ("literal", "different"),
+    [
+        ('"a  b"', '"a b"'),
+        (r'"a\"  b"', r'"a\" b"'),
+        ('R"tag(a  b " quoted )tag"', 'R"tag(a b " quoted )tag"'),
+        ("'\t'", "' '"),
+    ],
+)
+async def test_function_matching_preserves_literal_whitespace(tmp_path, literal, different):
+    func = f"void f(void) {{ use({literal}); }}"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": func}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_course(
+            CourseSample(
+                idx=1,
+                commit_url=COMMIT_URL,
+                target=0,
+                func=func.replace(literal, different),
+            )
+        )
+    assert failure.value.code == "function_not_found"
+
+
+async def test_function_in_an_oversized_file_reports_a_scan_limit(tmp_path):
+    from app.repository.locate import MAX_SCAN_BYTES
+
+    func = "int f(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"large.c": "/*" + "x" * MAX_SCAN_BYTES + "*/\n" + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_course(
+            CourseSample(
+                idx=1,
+                commit_url=COMMIT_URL,
+                target=0,
+                func=func,
+            )
+        )
+    assert failure.value.code == "function_scan_limit"
+    assert "无法确认" in failure.value.message and "不一致" not in failure.value.message

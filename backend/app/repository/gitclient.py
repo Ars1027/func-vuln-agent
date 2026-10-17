@@ -10,13 +10,18 @@ import logging
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from app.schemas.paths import normalize_snapshot_path
 from app.schemas.ports import IntegrationError
 
 logger = logging.getLogger(__name__)
@@ -213,6 +218,7 @@ class SubprocessGitClient:
         options: tuple[str, ...] | None = None,
         cancel_event: threading.Event | None = None,
         text: bool = True,
+        quota_path: Path | None = None,
     ) -> _CommandResult:
         command = [self.executable, *(options or self.options), *args]
         deadline = time.monotonic() + self.timeout_seconds
@@ -228,27 +234,116 @@ class SubprocessGitClient:
                 encoding="utf-8" if text else None,
                 errors="replace" if text else None,
                 shell=False,
+                **self._process_group_options(),
             )
         except FileNotFoundError as exc:
             raise IntegrationError(
                 "git_unavailable", "服务器未安装 Git，无法获取代码快照。"
             ) from exc
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                process.kill()
-                process.communicate()
-                raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                process.kill()
-                process.communicate()
-                raise IntegrationError("repository_fetch_timeout", "获取代码快照超时。")
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise IntegrationError("repository_fetch_timeout", "获取代码快照超时。")
+                if quota_path is not None:
+                    self._enforce_mirror_quota(keep=quota_path, remove_keep=False)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            self._kill_process(process)
+            process.communicate()
+            raise
         return _CommandResult(command, process.returncode, stdout, stderr)
+
+    @staticmethod
+    def _process_group_options() -> dict:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NO_WINDOW}
+        return {"start_new_session": True}
+
+    @staticmethod
+    def _kill_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            # Git fetch 的 HTTP/索引子进程也必须结束，否则管道和镜像文件仍被占用。
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+
+    @contextmanager
+    def _stream_process(
+        self,
+        args: list[str],
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[subprocess.Popen]:
+        """流式读管道时由独立监视线程执行取消/超时，阻塞 read 也能被中断。"""
+        process = subprocess.Popen(
+            [self.executable, *self.options, *args],
+            env=self._environment(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            **self._process_group_options(),
+        )
+        done = threading.Event()
+        failure: list[IntegrationError] = []
+        deadline = time.monotonic() + self.timeout_seconds
+
+        def watch() -> None:
+            while not done.wait(0.05):
+                if process.poll() is not None:
+                    return
+                if cancel_event is not None and cancel_event.is_set():
+                    failure.append(
+                        IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
+                    )
+                elif time.monotonic() >= deadline:
+                    failure.append(
+                        IntegrationError("repository_fetch_timeout", "获取代码快照超时。")
+                    )
+                else:
+                    continue
+                self._kill_process(process)
+                return
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            yield process
+            if failure:
+                raise failure[0]
+        except BaseException as exc:
+            if failure:
+                raise failure[0] from exc
+            raise
+        finally:
+            done.set()
+            self._kill_process(process)
+            process.wait()
+            watcher.join()
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
 
     def _run(
         self,
@@ -257,8 +352,11 @@ class SubprocessGitClient:
         code: str,
         options: tuple[str, ...] | None = None,
         cancel_event: threading.Event | None = None,
+        quota_path: Path | None = None,
     ) -> str:
-        completed = self._execute(args, options=options, cancel_event=cancel_event)
+        completed = self._execute(
+            args, options=options, cancel_event=cancel_event, quota_path=quota_path
+        )
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip().splitlines()
             if detail:
@@ -280,9 +378,25 @@ class SubprocessGitClient:
 
     def local_mirror(self, repo_url: str) -> Path | None:
         mirror = self._mirror_path(repo_url)
-        if (mirror / "HEAD").is_file():
-            return mirror
+        with self._lock_for(mirror):
+            if (mirror / "HEAD").is_file():
+                os.utime(mirror)
+                return mirror
         return None
+
+    def _remove_mirror(self, path: Path) -> None:
+        """只清理缓存根内的目录，并处理 Windows 上 Git 的只读对象文件。"""
+        root, target = self.mirror_root.resolve(), path.resolve()
+        if target == root or not target.is_relative_to(root):
+            raise IntegrationError("repository_fetch_failed", "镜像路径超出缓存目录。")
+        if not target.exists():
+            return
+
+        def make_writable(action, failed_path, _error):
+            os.chmod(failed_path, stat.S_IWRITE | stat.S_IREAD)
+            action(failed_path)
+
+        shutil.rmtree(target, onerror=make_writable)
 
     def has_commit(self, handle: Path, commit: str) -> bool:
         completed = self._execute(["-C", str(handle), "cat-file", "-e", f"{commit}^{{commit}}"])
@@ -291,7 +405,7 @@ class SubprocessGitClient:
     def _ensure_remote(self, mirror: Path, repo_url: str) -> None:
         """修复缺 HEAD 或缺少/错误 origin 的半成品镜像。"""
         if not (mirror / "HEAD").is_file():
-            shutil.rmtree(mirror, ignore_errors=True)
+            self._remove_mirror(mirror)
             mirror.parent.mkdir(parents=True, exist_ok=True)
             self._run(["init", "--bare", "--quiet", str(mirror)], code="repository_fetch_failed")
         current = self._execute(["-C", str(mirror), "config", "--get", "remote.origin.url"])
@@ -317,15 +431,19 @@ class SubprocessGitClient:
         mirror = self._mirror_path(repo_url)
         options = options or self.options
         with self._lock_for(mirror):
-            self._ensure_remote(mirror, repo_url)
-            if not self.has_commit(mirror, commit):
-                self._fetch_commit(mirror, commit, options=options, cancel_event=cancel_event)
             try:
-                os.utime(mirror)
-            except OSError:
-                pass
-            self._enforce_mirror_quota(keep=mirror)
+                self._ensure_remote(mirror, repo_url)
+                self._enforce_mirror_quota(keep=mirror, remove_keep=False)
+                if not self.has_commit(mirror, commit):
+                    self._fetch_commit(mirror, commit, options=options, cancel_event=cancel_event)
+            finally:
+                self._finish_fetch(mirror)
         return mirror
+
+    def _finish_fetch(self, mirror: Path) -> None:
+        if mirror.exists():
+            os.utime(mirror)
+        self._enforce_mirror_quota(keep=mirror)
 
     def _fetch_commit(
         self,
@@ -353,7 +471,11 @@ class SubprocessGitClient:
         for args in attempts:
             try:
                 self._run(
-                    args, code="repository_fetch_failed", options=options, cancel_event=cancel_event
+                    args,
+                    code="repository_fetch_failed",
+                    options=options,
+                    cancel_event=cancel_event,
+                    quota_path=mirror,
                 )
             except _GitFailure:
                 continue
@@ -363,6 +485,12 @@ class SubprocessGitClient:
         if self.has_commit(mirror, commit):
             return
         if reachable:
+            if len(commit) < 40 and (mirror / "shallow").is_file():
+                raise IntegrationError(
+                    "commit_lookup_limited",
+                    f"缩写提交未在最多 {self.max_fetch_depth} 层历史中找到，"
+                    "请提供完整的 40 位提交标识。",
+                )
             # 托管端点可达但提交对象不存在（例如链接中的 sha 不存在）。
             raise IntegrationError("commit_not_found", "托管主机上找不到指定提交。")
         raise IntegrationError("repository_fetch_failed", "无法从代码托管主机获取指定提交。")
@@ -379,21 +507,25 @@ class SubprocessGitClient:
             return
         options = options or self.options
         with self._lock_for(handle):
-            if not self.has_commit(handle, commit):
-                self._fetch_commit(handle, commit, options=options, cancel_event=cancel_event)
+            try:
+                if not self.has_commit(handle, commit):
+                    self._fetch_commit(handle, commit, options=options, cancel_event=cancel_event)
+            finally:
+                self._finish_fetch(handle)
 
     def resolve(self, handle: Path, commit: str) -> str:
-        output = self._run(
-            [
-                "-C",
-                str(handle),
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                f"{commit}^{{commit}}",
-            ],
-            code="commit_not_found",
-        )
+        with self._lock_for(handle):
+            output = self._run(
+                [
+                    "-C",
+                    str(handle),
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    f"{commit}^{{commit}}",
+                ],
+                code="commit_not_found",
+            )
         resolved = output.strip()
         if len(resolved) != 40 or any(ch not in "0123456789abcdef" for ch in resolved):
             raise IntegrationError("commit_not_found", "提交标识无法解析为完整提交。")
@@ -402,10 +534,11 @@ class SubprocessGitClient:
     def parents(self, handle: Path, commit: str) -> list[str]:
         # 直接读取提交对象头部：shallow 克隆的 rev-list 会隐藏父提交，
         # 但 cat-file 仍保留 parent 行，因此能可靠判断多父提交。
-        output = self._run(
-            ["-C", str(handle), "cat-file", "commit", commit],
-            code="commit_not_found",
-        )
+        with self._lock_for(handle):
+            output = self._run(
+                ["-C", str(handle), "cat-file", "commit", commit],
+                code="commit_not_found",
+            )
         parents = []
         for line in output.splitlines():
             if line.startswith("parent "):
@@ -424,29 +557,42 @@ class SubprocessGitClient:
         cancel_event: threading.Event | None = None,
     ) -> int:
         """按提交树直接读取 blob，不应用 `export-ignore`/`export-subst`。"""
+        with self._lock_for(handle):
+            return self._export(handle, commit, destination, cancel_event=cancel_event)
+
+    def _export(
+        self,
+        handle: Path,
+        commit: str,
+        destination: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
         entries = self._tree_entries(handle, commit, cancel_event=cancel_event)
         if len(entries) > self.max_files:
             raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
         destination.mkdir(parents=True, exist_ok=True)
         root = destination.resolve()
-        # 命令由固定子命令与已校验的镜像句柄组成，未使用 shell。
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        process = subprocess.Popen(
-            [self.executable, *self.options, "-C", str(handle), "cat-file", "--batch"],
-            env=self._environment(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-        )
         count = 0
         total = 0
-        try:
+        paths: dict[str, str] = {}
+        with self._stream_process(
+            ["-C", str(handle), "cat-file", "--batch"], cancel_event=cancel_event
+        ) as process:
             assert process.stdin is not None and process.stdout is not None
             for sha, raw_path in entries:
                 if cancel_event is not None and cancel_event.is_set():
                     raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
                 relative = _relative_path(raw_path)
+                parts = relative.split("/")
+                for length in range(1, len(parts) + 1):
+                    prefix = "/".join(parts[:length])
+                    canonical = prefix.casefold()
+                    if canonical in paths and paths[canonical] != prefix:
+                        raise IntegrationError(
+                            "snapshot_export_failed", "提交包含跨平台冲突的路径。"
+                        )
+                    paths[canonical] = prefix
                 process.stdin.write(sha.encode("ascii") + b"\n")
                 process.stdin.flush()
                 header = process.stdout.readline()
@@ -467,12 +613,6 @@ class SubprocessGitClient:
                 target.write_bytes(data)
                 count += 1
                 total += size
-        finally:
-            if process.stdin is not None:
-                process.stdin.close()
-            if process.poll() is None:
-                process.kill()
-            process.wait()
         return count
 
     def _tree_entries(
@@ -482,30 +622,35 @@ class SubprocessGitClient:
         *,
         cancel_event: threading.Event | None = None,
     ) -> list[tuple[str, bytes]]:
-        completed = self._execute(
+        entries: list[tuple[str, bytes]] = []
+        with self._stream_process(
             ["-C", str(handle), "ls-tree", "-r", "-z", "--full-tree", commit],
             cancel_event=cancel_event,
-            text=False,
-        )
-        if completed.returncode != 0:
-            raise IntegrationError("snapshot_export_failed", "读取指定版本文件树失败。")
-        entries: list[tuple[str, bytes]] = []
-        for record in completed.stdout.split(b"\0"):
-            if not record:
-                continue
-            meta, _, raw_path = record.partition(b"\t")
-            fields = meta.split()
-            if len(fields) < 3 or not raw_path:
-                continue
-            mode, kind, sha = fields[0], fields[1], fields[2]
-            if kind != b"blob" or mode == b"120000":
-                # 符号链接与子模块无法安全物化为快照文件。
-                continue
-            entries.append((sha.decode("ascii"), raw_path))
+        ) as process:
+            assert process.stdout is not None
+            pending = b""
+            while chunk := process.stdout.read1(4096):
+                pending += chunk
+                while b"\0" in pending:
+                    record, pending = pending.split(b"\0", 1)
+                    meta, _, raw_path = record.partition(b"\t")
+                    fields = meta.split()
+                    if len(fields) < 3 or not raw_path:
+                        continue
+                    mode, kind, sha = fields[0], fields[1], fields[2]
+                    if kind != b"blob" or mode == b"120000":
+                        continue
+                    if len(entries) >= self.max_files:
+                        raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
+                    entries.append((sha.decode("ascii"), raw_path))
+                if len(pending) > 65536:
+                    raise IntegrationError("snapshot_export_failed", "提交中的文件路径过长。")
+            if pending or process.wait() != 0:
+                raise IntegrationError("snapshot_export_failed", "读取指定版本文件树失败。")
         entries.sort(key=lambda item: item[1])
         return entries
 
-    def _enforce_mirror_quota(self, *, keep: Path) -> None:
+    def _enforce_mirror_quota(self, *, keep: Path, remove_keep: bool = True) -> None:
         if self.max_total_bytes is None or not self.mirror_root.is_dir():
             return
         with self._quota_lock:
@@ -531,9 +676,17 @@ class SubprocessGitClient:
                     continue
                 if idle < self.min_idle_seconds:
                     continue
-                shutil.rmtree(path, ignore_errors=True)
-                total -= sizes[path]
+                lock = self._lock_for(path)
+                if not lock.acquire(blocking=False):
+                    continue
+                try:
+                    self._remove_mirror(path)
+                    total -= sizes[path]
+                finally:
+                    lock.release()
             if total > self.max_total_bytes:
+                if remove_keep:
+                    self._remove_mirror(keep)
                 raise IntegrationError("storage_quota_exceeded", "快照镜像存储配额已用尽。")
 
 
@@ -548,9 +701,10 @@ def _relative_path(raw: bytes) -> str:
     parts = path.split("/")
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise IntegrationError("snapshot_export_failed", "提交包含非法路径。")
-    if any(part.casefold() == ".git" for part in parts):
-        raise IntegrationError("snapshot_export_failed", "提交包含 Git 元数据路径。")
-    return "/".join(parts)
+    try:
+        return normalize_snapshot_path(path)
+    except ValueError as exc:
+        raise IntegrationError("snapshot_export_failed", "提交包含跨平台歧义的路径。") from exc
 
 
 def _directory_size(path: Path) -> int:
