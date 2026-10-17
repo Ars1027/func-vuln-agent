@@ -1,0 +1,106 @@
+# 指定版本快照与代码证据工具（#3 / #4）
+
+本目录实现 [接口约定](../../../docs/interfaces.md) 中的 `Preparation` 与 `Repository`：
+按课程 `target` 或显式 `revision` 物化单个提交的文件树，并在此快照内提供代码搜索、
+按行读取和符号定义/调用查询。检测内核、API 与报告由其他模块负责。
+
+## 1. 版本选择与输入
+
+| 入口 | 选版规则 |
+| --- | --- |
+| `prepare_course(sample)` | `target=1` 取修复提交的父提交；`target=0` 取修复提交本身 |
+| `prepare_snapshot(request)` | 直接使用请求中的 `revision=commit` 或 `revision=parent`（Web 明确选择、Bot 传 `commit`） |
+
+返回 `DetectionInput{idx, func, snapshot_ref}`，保留输入的 `idx` 原类型与 `func` 原文。
+标签、`commit_url`、`revision`、diff 与另一版本只存在于准备层，不进入 `DetectionInput`
+或任何工具结果。多父提交返回 `multi_parent_commit`，根提交请求父版本返回
+`parent_unavailable`；函数在快照中缺失或不唯一时准备失败
+（`function_not_found` / `function_ambiguous`），不会把不一致的样本交给 Agent。
+
+## 2. 提交链接与获取边界
+
+支持 `https://<host>/<owner>/<repo>/commit/<sha>`，可选 `.patch` / `.diff` 后缀、查询串与
+片段；`sha` 为 7–40 位十六进制。默认主机白名单只有 `github.com`，可用
+`FVA_REPOSITORY_HOSTS`（逗号分隔）扩展，课程数据确认主机后需要核对默认值。
+
+拒绝非 https、带凭据或端口、IP 字面量、白名单外主机（`unsupported_commit_url`、
+`unsupported_host`）；拒绝解析到私网、回环、链路本地、保留地址或 CGNAT 的托管主机
+（`private_network_target`）以及无法解析的主机（`network_unavailable`）。
+
+Git 命令固定带 `http.followRedirects=false`、`protocol.allow=never`、
+`protocol.https.allow=always`、禁用凭据助手与钩子，并清空继承的 `GIT_DIR` 等变量。
+拉取失败、提交缺失与导出失败分别返回 `repository_fetch_failed`、`commit_not_found`、
+`snapshot_export_failed`；`git` 不在 PATH 时返回 `git_unavailable`。
+
+## 3. 存储与快照内容
+
+```
+storage/
+  git/<repo-hash>.git          # 裸镜像缓存，仅准备层访问
+  snapshots/<snapshot_ref>/    # 物化后的文件树，不含 .git
+  refs/<snapshot_ref>.json     # 提交与仓库元数据，位于快照之外
+  tmp/                         # 原子发布的临时目录
+```
+
+`snapshot_ref` 为 `snap-<16 位十六进制>`，由仓库地址与提交哈希派生，不携带标签或选版
+语义。只导出普通文件，跳过符号链接、子模块与 `.git` 条目；先写入 `tmp/` 再原子改名
+发布，元数据最后写入。单快照默认上限 200000 个文件 / 256 MiB。工具只接受登记过的
+`snapshot_ref`，格式错误或未登记一律 `snapshot_not_found`，不按路径猜测其他快照。
+
+## 4. 证据工具
+
+| 工具 | 语义 | 覆盖范围 |
+| --- | --- | --- |
+| `search_code(query)` | 在快照的 C/C++ 源文件中做大小写敏感的字面量搜索，空白折叠后匹配，返回匹配所在完整行 | 文本级；不区分注释/字符串；默认最多 20 条并在 `scope` 中说明总数与截断 |
+| `read_file(path, start_line, end_line)` | 按 1 起始行号读取原文，`end_line` 超出文件时钳制并在 `scope` 说明 | 单次最多 400 行，超限 `range_too_large`；起始行越界 `line_out_of_range` |
+| `find_symbol(symbol)` | 按标识符边界定位定义、`#define` 宏、声明、调用与其他引用 | 依据括号/花括号文本形态分类，头文件中的 `name(...);` 视为声明；注释与字符串不剔除；默认最多 20 条 |
+
+`find_symbol` 返回顺序为定义/宏、声明、调用、其他引用，`scope` 列出前若干条的
+`路径:行号 分类` 与统计，便于 Agent 追踪辅助函数、调用方与全局变量。`locate_function`
+在准备阶段定位待测函数，作为首条代码证据。所有位置都包含快照相对路径、1 起始行号与
+原文片段，`content` 为原文完整行。
+
+工具只做检索与读取，不判断证据支持还是反驳某个条件；条件状态由 Agent 结合报告证据判定。
+
+## 5. “未找到”与“执行失败”
+
+- 搜索/符号查询无结果：返回 `matches=[]`，`scope` 记录扫描文件数与 0 条匹配；
+- 文件不存在、路径越界、非文本、行号越界、区间过大、快照未登记：抛 `IntegrationError`，
+  由运行时报告为样本失败，绝不补成 `prediction=0`。
+
+错误码：`invalid_path`、`path_escape`、`file_not_found`、`file_unreadable`、
+`line_out_of_range`、`range_too_large`、`invalid_line_range`、`invalid_symbol`、
+`empty_query`、`snapshot_not_found`、`snapshot_too_large`、`snapshot_write_failed`。
+
+## 6. 验证记录
+
+命令（仓库根目录）：
+
+```sh
+python -m ruff check .
+python -m ruff format --check .
+python -m pytest -q
+```
+
+本机结果：`130 passed`，ruff 检查与格式检查通过。新增测试：
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `tests/test_repository_prepare.py` | `target=1/0` 与 `revision=commit/parent` 选版一致、`idx/func` 保留且结果不含选版信息、重复准备复用快照、快照间隔离、引用不可猜测、多父提交、根提交、仓库/提交缺失、函数不一致与重复、URL 白名单、私网与 DNS 失败 |
+| `tests/test_repository_tools.py` | 行号与原文一致、`end_line` 钳制、行区间上限、缺失文件、目录穿越、`.git` 路径、二进制文件、搜索命中/无命中/截断、边界检查与检查后数据变化、定义与声明与调用与注释引用分类、相似标识符不合并、宏与全局变量、跨文件调用路径、非法符号、未知快照引用 |
+| `tests/test_repository_git.py` | 真实 Git：拉取提交、解析父提交、按提交导出、快照不含 `.git`、镜像缓存复用、缺失仓库与提交、传输加固参数 |
+
+`tests/test_repository_*.py` 的仓库内容均为人工编写的合成 C 片段，配合内存 `FakeGit`
+（`tests/fake_git.py`）或本地临时 Git 仓库，不调用网络与课程数据，不代表真实检测效果。
+`tests/test_demo.py::test_real_factory_never_silently_uses_demo` 随本次接入更新：真实工厂
+对演示链接返回 `unsupported_host`，不再回退到合成适配器。
+
+## 7. 依赖与后续
+
+- 部署环境需提供 `git`（在 PATH 中）；未安装时准备与仓库工具返回 `git_unavailable`。
+  本机验证使用便携版 Git（仅放在被忽略的 `work/` 目录，不提交）。
+- 课程数据尚未到达，`commit_url` 的实际主机与路径形式、父提交规则需在数据到位后核对；
+  如出现 `github.com` 以外的主机，通过 `FVA_REPOSITORY_HOSTS` 显式加入并补充验证。
+- 函数定位与符号查询是文本级启发式，不覆盖宏展开、条件编译与编译器 AST；复杂仓库的
+  定位质量仍需课程样本评估。
+- 本模块只提供代码证据；`AgentRunner` 负责分配证据 ID、记录 trace 与条件状态。

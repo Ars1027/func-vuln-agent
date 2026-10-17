@@ -45,6 +45,8 @@ uv run uvicorn app.main:build_app --factory --app-dir backend --host 127.0.0.1 -
 | 史鹏飞 #7 | `ResultExporter.export(input_ids, reports)` | 输出仅有 `idx/prediction` 的完整有序 JSONL；保留标识类型 |
 | 周德铭 #6 | HTTP、SSE、`ReportsSnapshot` | 初始快照加 seq 续接，样本内 ID 更新，不合并整数和字符串 idx |
 
+#3/#4 的默认适配器位于 `backend/app/repository/`，模块说明、快照布局、错误码与验证记录见该目录 [README](../backend/app/repository/README.md)；`app.main` 已接入准备层与仓库工具，检索和导出仍由缺失适配器返回 `dependency_unavailable`。
+
 `POST /api/snapshots` 的请求为 `{idx, func, commit_url, revision}`，`revision` 必填，响应为可直接提交检测的 `{idx, func, snapshot_ref}`。单条检测增加可选 `mode`；批量表单字段名为 `file` 和 `mode`。课程 JSONL 暂只接受已确认的四字段，拿到数据后由 #1 核对扩展字段，而不是将未审查的字段传给模型。
 
 准备层不得改变输入的 `idx/func`，API 会核对返回值。默认每批上限为 10 MiB JSONL 内容和 1000 个样本，超限返回 413；可通过应用工厂的 `max_batch_bytes/max_batch_samples` 参数调整。multipart 解析可能先将上传内容暂存到磁盘，公开部署仍需入口层请求大小限制。
