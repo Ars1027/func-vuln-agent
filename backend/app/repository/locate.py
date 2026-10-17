@@ -206,9 +206,10 @@ def search_code(
     limit: int = 20,
     max_file_bytes: int = MAX_SCAN_BYTES,
     match_budget: int = MAX_MATCH_BUDGET,
+    cancel_event: threading.Event | None = None,
 ) -> RepositoryResult:
     """在快照的 C/C++ 源文件内做字面量搜索，返回完整行区间。"""
-    needle, _ = normalize_whitespace(query)
+    needle, _ = normalize_whitespace(query, cancel_event=cancel_event)
     if not needle:
         raise IntegrationError("empty_query", "搜索内容不能为空。")
     report = ScanReport()
@@ -217,9 +218,11 @@ def search_code(
     total = 0
     truncated = False
     locations_truncated = False
-    for entry in store.iter_files(snapshot_ref, max_bytes=max_file_bytes, report=report):
+    for entry in store.iter_files(
+        snapshot_ref, max_bytes=max_file_bytes, report=report, cancel_event=cancel_event
+    ):
         line, cursor = 1, 0
-        for start, end in iter_matches(entry.text, needle):
+        for start, end in iter_matches(entry.text, needle, cancel_event=cancel_event):
             if total >= match_budget:
                 truncated = True
                 break
@@ -246,6 +249,7 @@ def search_code(
             )
         if truncated:
             break
+    check_scan_cancelled(cancel_event)
     scope = (
         f"case-sensitive literal text search (whitespace-normalized) over "
         f"{report.scanned} C/C++ files; {total}{'+' if truncated else ''} match(es), "
@@ -284,11 +288,16 @@ def _matching_paren(text: str, start: int) -> int:
 
 def _opener_kind(text: str, index: int) -> str:
     header = text[max(0, index - 300) : index]
+    header = _LEXEMES.sub(
+        lambda match: " " if match.group("comment") is not None else match.group(), header
+    )
     header = header[header.rfind(";") + 1 :]
     stripped = header.rstrip()
     if not stripped:
         return "block"
     if _SCOPE_OPENERS.search(stripped) and not stripped.endswith(")"):
+        return "scope"
+    if re.search(r'\bextern\s*"C(?:\+\+)?"\s*$', stripped):
         return "scope"
     if stripped.endswith(")"):
         return "function"
@@ -298,7 +307,7 @@ def _opener_kind(text: str, index: int) -> str:
 
 
 def _symbol_contexts(
-    text: str, matches: Iterator[re.Match]
+    text: str, matches: Iterator[re.Match], *, cancel_event: threading.Event | None = None
 ) -> Iterator[tuple[re.Match, bool, int]]:
     """按符号位置向前扫描一次，避免对每次出现重新扫描整个文件前缀。"""
     stack: list[bool] = []
@@ -308,8 +317,13 @@ def _symbol_contexts(
     quote: str | None = None
     line_comment = False
     block_comment = False
+    next_cancel_check = 0
     for match in matches:
+        check_scan_cancelled(cancel_event)
         while index < match.start():
+            if cancel_event is not None and index >= next_cancel_check:
+                check_scan_cancelled(cancel_event)
+                next_cancel_check = index + 4096
             character = text[index]
             if character == "\n":
                 line_start = index + 1
@@ -358,6 +372,72 @@ def _looks_like_declaration(prefix: str) -> bool:
     return tokens[-1] not in _IDENTIFIER_KEYWORDS
 
 
+def _has_variable_initializer(after: str) -> bool:
+    """跳过当前声明符的数组维度，只在其后判断初始化，避免混入同句的其他变量。"""
+    depth = 0
+    for character in _LEXEMES.sub(" ", after):
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+        elif depth == 0 and not character.isspace():
+            return character in "={"
+    return False
+
+
+def _direct_extern_initializer(header: str) -> bool:
+    """识别 extern 变量的直接列表初始化，排除带括号的函数声明头。"""
+    if not re.search(r"\bextern\b", header):
+        return False
+    depth = 0
+    outside_arrays: list[str] = []
+    for character in header:
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+        elif depth == 0:
+            outside_arrays.append(character)
+    declarator = "".join(outside_arrays).rsplit(",", 1)[-1].strip()
+    declarator = re.split(r"[;{}]", declarator)[-1].strip()
+    return not re.search(r"[()]", declarator) and bool(
+        re.search(r"\b[A-Za-z_][A-Za-z0-9_]*$", declarator)
+    )
+
+
+def _variable_prefix(text: str, offset: int) -> str:
+    """只在有界窗口内回溯当前声明，跨过初始化列表但不跨越作用域边界。"""
+    source = text[max(0, offset - CLASSIFY_LOOKAHEAD) : offset]
+    prefix = _LEXEMES.sub(lambda match: " " * len(match.group()), source)
+    index = len(prefix) - 1
+    while index >= 0:
+        if prefix[index] in ";{":
+            return prefix[index + 1 :]
+        if prefix[index] != "}":
+            index -= 1
+            continue
+        closing, depth = index, 1
+        while index > 0 and depth:
+            index -= 1
+            if prefix[index] == "}":
+                depth += 1
+            elif prefix[index] == "{":
+                depth -= 1
+        if depth:
+            return prefix[closing + 1 :]
+        boundary = max(prefix.rfind(mark, 0, index) for mark in ";{}") + 1
+        header = source[boundary:index]
+        kind = _opener_kind(header, len(header))
+        if kind != "initializer" and not (
+            kind == "block" and _direct_extern_initializer(prefix[:index])
+        ):
+            return prefix[closing + 1 :]
+        # 初始化器里的 extern 等内容不属于当前声明的存储类。
+        prefix = prefix[:index] + " " * (closing - index + 1) + prefix[closing + 1 :]
+        index -= 1
+    return prefix
+
+
 def _classify(text: str, offset: int, symbol: str, *, global_scope: bool, line_start: int) -> str:
     if offset - line_start < 200 and re.fullmatch(
         rf"\s*#\s*define\s+{re.escape(symbol)}", text[line_start : offset + len(symbol)]
@@ -375,8 +455,11 @@ def _classify(text: str, offset: int, symbol: str, *, global_scope: bool, line_s
                 return "definition"
         prefix = text[max(line_start, offset - 200) : offset]
         return "declaration" if _looks_like_declaration(prefix) else "call"
-    stripped = text[offset + len(symbol) : offset + len(symbol) + 40].lstrip()
-    if stripped[:1] in {"=", ";", "["} and global_scope:
+    stripped = _LEXEMES.sub(" ", after).lstrip()
+    if stripped[:1] in {"=", ";", "[", "{", ","} and global_scope:
+        prefix = _variable_prefix(text, offset)
+        if re.search(r"\bextern\b", prefix) and not _has_variable_initializer(after):
+            return "declaration"
         return "definition"
     return "reference"
 
@@ -390,24 +473,31 @@ def find_symbol(
     max_file_bytes: int = MAX_SCAN_BYTES,
     max_occurrences: int = 5000,
     scan_byte_budget: int = MAX_SCAN_TOTAL_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> RepositoryResult:
     """按标识符定位定义、宏、声明与调用位置。"""
+    check_scan_cancelled(cancel_event)
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol):
         raise IntegrationError("invalid_symbol", "符号名称必须是单个 C/C++ 标识符。")
     pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])")
     report = ScanReport()
     buckets: dict[int, list[SymbolMatch]] = {rank: [] for rank in set(_RANK.values())}
+    seen: dict[int, set[tuple[str, int, int]]] = {rank: set() for rank in buckets}
     counted = 0
     scanned_bytes = 0
     count_truncated = False
     scan_truncated = False
-    for entry in store.iter_files(snapshot_ref, max_bytes=max_file_bytes, report=report):
+    locations_truncated = False
+    for entry in store.iter_files(
+        snapshot_ref, max_bytes=max_file_bytes, report=report, cancel_event=cancel_event
+    ):
         scanned_bytes += entry.size
         if scanned_bytes > scan_byte_budget:
             scan_truncated = True
             break
+        line, cursor = 1, 0
         for match, global_scope, line_start in _symbol_contexts(
-            entry.text, pattern.finditer(entry.text)
+            entry.text, pattern.finditer(entry.text), cancel_event=cancel_event
         ):
             if counted >= max_occurrences:
                 count_truncated = True
@@ -416,9 +506,17 @@ def find_symbol(
             kind = _classify(
                 entry.text, match.start(), symbol, global_scope=global_scope, line_start=line_start
             )
-            bucket = buckets[_RANK[kind]]
-            if len(bucket) >= limit:
+            rank = _RANK[kind]
+            bucket = buckets[rank]
+            line += entry.text.count("\n", cursor, match.start())
+            cursor = match.start()
+            key = (entry.path, line, line)
+            if key in seen[rank]:
                 continue
+            if len(bucket) >= limit:
+                locations_truncated = True
+                continue
+            seen[rank].add(key)
             start_line, end_line, content = _expand_lines(entry.text, match.start(), match.end())
             bucket.append(
                 SymbolMatch(
@@ -432,18 +530,25 @@ def find_symbol(
                     kind=kind,
                 )
             )
+    check_scan_cancelled(cancel_event)
     candidates = [item for bucket in buckets.values() for item in bucket]
     candidates.sort(
         key=lambda item: (_RANK[item.kind], item.location.path, item.location.start_line)
     )
-    selected = candidates[:limit]
+    distinct: dict[tuple[str, int, int], SymbolMatch] = {}
+    for item in candidates:
+        location = item.location
+        distinct.setdefault((location.path, location.start_line, location.end_line), item)
+    selected = list(distinct.values())[:limit]
+    locations_truncated |= len(distinct) > limit
     summary = ", ".join(
         f"{item.location.path}:{item.location.start_line} {item.kind}" for item in selected[:8]
     )
     scope = (
         f"text-level identifier scan over {report.scanned} C/C++ files; "
         f"{counted}{'+' if count_truncated or scan_truncated else ''} occurrence(s), "
-        f"returning {len(selected)}; order: definitions/macros, declarations, calls, other "
+        f"returning {len(selected)} distinct location(s); "
+        "order: definitions/macros, declarations, calls, other "
         f"references; classification by parenthesis and brace heuristics with {CLASSIFY_LOOKAHEAD}"
         "-character lookahead, comments and strings "
         "are not excluded, not a compiler AST"
@@ -454,7 +559,7 @@ def find_symbol(
         scope += f"; scan stopped after {scan_byte_budget} bytes"
     if summary:
         scope += f"; matches: {summary}"
-    if counted > len(selected) or count_truncated:
+    if locations_truncated:
         scope += f" (truncated by limit {limit})"
     skipped = report.note()
     if skipped:

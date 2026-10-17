@@ -322,3 +322,159 @@ def test_running_fetch_checks_quota_before_reading_more_output(tmp_path, monkeyp
         client._execute(["fetch"], quota_path=mirror)
     assert failure.value.code == "storage_quota_exceeded"
     assert process.returncode == -9
+
+
+def test_running_fetch_does_not_rescan_all_mirrors_on_every_poll(tmp_path, monkeypatch):
+    clock = [0.0]
+    checks = []
+    polls = []
+    client = SubprocessGitClient(tmp_path / "mirrors", timeout_seconds=10)
+
+    class PollingProcess(_FakeProcess):
+        def communicate(self, timeout=None):
+            polls.append(clock[0])
+            clock[0] += 0.2
+            if len(polls) < 12:
+                raise subprocess.TimeoutExpired(self.command, timeout)
+            return "", ""
+
+    monkeypatch.setattr("app.repository.gitclient.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "app.repository.gitclient.subprocess.Popen", lambda *a, **kw: PollingProcess([])
+    )
+    monkeypatch.setattr(client, "_enforce_mirror_quota", lambda **kwargs: checks.append(clock[0]))
+    client._execute(["fetch"], quota_path=tmp_path / "mirrors" / "working.git")
+    assert checks[0] == 0
+    assert 2 <= len(checks) < len(polls) // 2
+    assert all(later - earlier >= 1 for earlier, later in zip(checks, checks[1:]))
+
+
+@pytest.mark.parametrize("failed_step", ["write", "flush", "header", "blob", "terminator"])
+def test_export_pipe_errors_survive_stream_cleanup(tmp_path, monkeypatch, failed_step):
+    import io
+    from types import SimpleNamespace
+
+    class Writer:
+        closed = False
+
+        def write(self, data):
+            if failed_step == "write":
+                raise BrokenPipeError("child exited")
+            return len(data)
+
+        def flush(self):
+            if failed_step == "flush":
+                raise BrokenPipeError("child exited")
+
+        def close(self):
+            self.closed = True
+            raise BrokenPipeError("close flushes pending input")
+
+    class Reader(io.BytesIO):
+        def readline(self, *args):
+            if failed_step == "header":
+                raise OSError("closed header pipe")
+            return super().readline(*args)
+
+        def read(self, size=-1):
+            if failed_step == "blob" or (failed_step == "terminator" and size == 1):
+                raise OSError("closed data pipe")
+            return super().read(size)
+
+    writer = Writer()
+    reader = Reader(b"1" * 40 + b" blob 3\nabc\n")
+    process = SimpleNamespace(stdin=writer, stdout=reader, poll=lambda: 0, wait=lambda: 0)
+    client = SubprocessGitClient(tmp_path / "mirrors")
+    monkeypatch.setattr("app.repository.gitclient.subprocess.Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(client, "_tree_entries", lambda *a, **kw: [("1" * 40, b"a.c")])
+    with pytest.raises(IntegrationError) as failure:
+        client.export(tmp_path / "mirror.git", "1" * 40, tmp_path / "exported")
+    assert failure.value.code == "snapshot_export_failed"
+    assert writer.closed and reader.closed
+
+
+@pytest.mark.parametrize("code", ["snapshot_export_failed", "repository_cancelled"])
+def test_real_exited_process_pipe_close_preserves_primary_error(tmp_path, code):
+    import sys
+
+    class PythonProcessClient(SubprocessGitClient):
+        @property
+        def options(self):
+            return ()
+
+    client = PythonProcessClient(tmp_path / "mirrors", executable=sys.executable)
+    expected = IntegrationError(code, "synthetic primary failure")
+    with pytest.raises(IntegrationError) as failure:
+        with client._stream_process(["-c", "pass"]) as process:
+            process.wait(timeout=2)
+            process.stdin.write(b"x")  # 保留待刷新的输入，close 将遇到已退出的子进程。
+            raise expected
+    assert failure.value is expected
+    assert process.stdin.closed and process.stdout.closed
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b"1" * 40 + b" blob -1\n",
+        b"1" * 40 + b" blob invalid\n",
+        b"1" * 40 + b" blob 3\nab",
+        b"1" * 40 + b" blob 3\nabc",
+    ],
+)
+def test_export_rejects_invalid_or_truncated_blob_responses(tmp_path, monkeypatch, response):
+    import io
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    client = SubprocessGitClient(tmp_path / "mirrors")
+
+    @contextmanager
+    def stream(*args, **kwargs):
+        yield SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(response))
+
+    monkeypatch.setattr(client, "_stream_process", stream)
+    monkeypatch.setattr(client, "_tree_entries", lambda *a, **kw: [("1" * 40, b"a.c")])
+    with pytest.raises(IntegrationError) as failure:
+        client.export(tmp_path / "mirror.git", "1" * 40, tmp_path / "exported")
+    assert failure.value.code == "snapshot_export_failed"
+
+
+@pytest.mark.parametrize("object_id", [b"\xff" * 40, b"1" * 39, b"z" * 40])
+def test_tree_rejects_invalid_object_ids_as_export_failures(tmp_path, monkeypatch, object_id):
+    import io
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    client = SubprocessGitClient(tmp_path / "mirrors")
+
+    @contextmanager
+    def stream(*args, **kwargs):
+        yield SimpleNamespace(
+            stdout=io.BytesIO(b"100644 blob " + object_id + b"\ta.c\0"), wait=lambda: 0
+        )
+
+    monkeypatch.setattr(client, "_stream_process", stream)
+    with pytest.raises(IntegrationError) as failure:
+        client._tree_entries(tmp_path / "mirror.git", "1" * 40)
+    assert failure.value.code == "snapshot_export_failed"
+
+
+@pytest.mark.parametrize("error", [OSError("closed tree pipe"), ValueError("closed stream")])
+def test_tree_pipe_read_errors_are_export_failures(tmp_path, monkeypatch, error):
+    import io
+    from types import SimpleNamespace
+
+    class Reader(io.BytesIO):
+        def read1(self, size=-1):
+            raise error
+
+    reader = Reader()
+    writer = io.BytesIO()
+    process = SimpleNamespace(stdin=writer, stdout=reader, poll=lambda: 0, wait=lambda: 0)
+    client = SubprocessGitClient(tmp_path / "mirrors")
+    monkeypatch.setattr("app.repository.gitclient.subprocess.Popen", lambda *a, **kw: process)
+    with pytest.raises(IntegrationError) as failure:
+        client.export(tmp_path / "mirror.git", "1" * 40, tmp_path / "exported")
+    assert failure.value.code == "snapshot_export_failed"
+    assert writer.closed and reader.closed

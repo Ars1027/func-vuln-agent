@@ -453,8 +453,19 @@ async def test_search_deduplication_preserves_multiline_ranges_and_match_budget(
     assert "match counting stopped at budget 1" in bounded.scope
 
 
+_TOOL_ARGUMENTS = {
+    "locate_function": (COPY_INTO,),
+    "search_code": ("missing_token",),
+    "find_symbol": ("missing_symbol",),
+    "read_file": ("src/buf.c", 1, 1),
+}
+
+
+@pytest.mark.parametrize("tool", _TOOL_ARGUMENTS)
 @pytest.mark.parametrize("timeout", [False, True])
-async def test_cancelled_function_scan_exits_before_await_returns(snapshot, monkeypatch, timeout):
+async def test_cancelled_repository_tool_exits_before_await_returns(
+    snapshot, monkeypatch, timeout, tool
+):
     import asyncio
     import threading
 
@@ -469,23 +480,28 @@ async def test_cancelled_function_scan_exits_before_await_returns(snapshot, monk
             while not stop_test.wait(0.005):
                 if cancel_event is not None and cancel_event.is_set():
                     break
-            return
-            yield  # 保持迭代器形态，模拟正在等待下一份源码的扫描。
+            return (["source"], 1, False) if tool == "read_file" else []
         finally:
             stopped.set()
 
-    monkeypatch.setattr(adapters.store, "iter_files", paused_files)
+    monkeypatch.setattr(
+        adapters.store, "read_lines" if tool == "read_file" else "iter_files", paused_files
+    )
+
+    deadline = asyncio.timeout(None)
 
     async def locate():
         if timeout:
-            async with asyncio.timeout(0.1):
-                return await adapters.locate_function(ref, COPY_INTO)
-        return await adapters.locate_function(ref, COPY_INTO)
+            async with deadline:
+                return await getattr(adapters, tool)(ref, *_TOOL_ARGUMENTS[tool])
+        return await getattr(adapters, tool)(ref, *_TOOL_ARGUMENTS[tool])
 
     task = asyncio.create_task(locate())
     try:
         assert await asyncio.to_thread(started.wait, 2)
-        if not timeout:
+        if timeout:
+            deadline.reschedule(asyncio.get_running_loop().time())
+        else:
             task.cancel()
         with pytest.raises(TimeoutError if timeout else asyncio.CancelledError):
             await asyncio.wait_for(task, 2)
@@ -496,7 +512,8 @@ async def test_cancelled_function_scan_exits_before_await_returns(snapshot, monk
         assert await asyncio.to_thread(stopped.wait, 2)
 
 
-async def test_repeated_cancellation_waits_for_function_scan_cleanup(snapshot, monkeypatch):
+@pytest.mark.parametrize("tool", _TOOL_ARGUMENTS)
+async def test_repeated_cancellation_waits_for_repository_cleanup(snapshot, monkeypatch, tool):
     import asyncio
     import threading
 
@@ -509,13 +526,14 @@ async def test_repeated_cancellation_waits_for_function_scan_cleanup(snapshot, m
             while not release.wait(0.005):
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled.set()
-            return
-            yield
+            return (["source"], 1, False) if tool == "read_file" else []
         finally:
             stopped.set()
 
-    monkeypatch.setattr(adapters.store, "iter_files", paused_files)
-    task = asyncio.create_task(adapters.locate_function(ref, COPY_INTO))
+    monkeypatch.setattr(
+        adapters.store, "read_lines" if tool == "read_file" else "iter_files", paused_files
+    )
+    task = asyncio.create_task(getattr(adapters, tool)(ref, *_TOOL_ARGUMENTS[tool]))
     try:
         assert await asyncio.to_thread(started.wait, 2)
         task.cancel()
@@ -551,4 +569,113 @@ def test_function_text_normalization_checks_cancellation_during_work():
     cancel = CancelDuringWork()
     with pytest.raises(IntegrationError) as failure:
         normalize_whitespace("x" * 20_000, cancel_event=cancel)
+    assert failure.value.code == "repository_cancelled"
+
+
+async def test_symbol_results_are_distinct_before_rank_limits(tmp_path):
+    from app.repository.locate import find_symbol
+
+    func = "int entry(void) { return 1; }"
+    files = {
+        "a.c": "void first(void) { " + "needle(); " * 20 + "}\n" + func,
+        "b.c": "void second(void) { needle(); }\n",
+        "c.c": "void third(void) { needle(); }\n",
+    }
+    fake = FakeGit({REPO: {COMMIT: files}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+    )
+    result = find_symbol(adapters.store, prepared.snapshot_ref, "needle", limit=3)
+    assert [(match.path, match.start_line) for match in result.matches] == [
+        ("a.c", 1),
+        ("b.c", 1),
+        ("c.c", 1),
+    ]
+    assert "22 occurrence(s)" in result.scope
+    assert "truncated by limit" not in result.scope
+
+    limited = find_symbol(adapters.store, prepared.snapshot_ref, "needle", limit=2)
+    assert [match.path for match in limited.matches] == ["a.c", "b.c"]
+    assert "truncated by limit 2" in limited.scope
+
+
+async def test_symbol_results_keep_highest_kind_for_one_location(tmp_path):
+    func = "int entry(void) { return 1; }"
+    text = "extern int needle; int needle = 1; /* needle */\n" + func
+    fake = FakeGit({REPO: {COMMIT: {"a.c": text}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+    )
+    result = await adapters.find_symbol(prepared.snapshot_ref, "needle")
+    assert len(result.matches) == 1
+    assert "a.c:1 definition" in result.scope
+    assert "3 occurrence(s)" in result.scope
+    assert "truncated by limit" not in result.scope
+
+
+@pytest.mark.parametrize(
+    ("declaration", "kind"),
+    [
+        ("extern int needle;", "declaration"),
+        ("extern int\nneedle;", "declaration"),
+        ("extern int needle[8];", "declaration"),
+        ("extern int needle[2][4];", "declaration"),
+        ("extern int other = 1, needle;", "declaration"),
+        ("extern int needle, other;", "declaration"),
+        ("extern int needle /* note */;", "declaration"),
+        ("extern int needle /* note */ = 1;", "definition"),
+        ("extern int other{1}, needle;", "declaration"),
+        ("extern int other[] = {1}, needle;", "declaration"),
+        ("extern int other[sizeof(int)]{1}, needle;", "declaration"),
+        ("extern int first{f()}, other{2}, needle;", "declaration"),
+        ("namespace N { extern int other{1}, needle; }", "declaration"),
+        ("extern int f() {} int needle;", "definition"),
+        ("extern int f() noexcept {} int needle;", "definition"),
+        ('extern "C" { int f(); } int needle;', "definition"),
+        ("int other = [] { extern int nested; return 1; }(), needle;", "definition"),
+        ("extern int needle = 1;", "definition"),
+        ("extern int needle[8] = {1};", "definition"),
+        ("extern int needle[limits[0]] = {1};", "definition"),
+        ("extern int needle{1};", "definition"),
+        ("extern int needle[]{1, 2};", "definition"),
+        ('extern "C" { int needle; }', "definition"),
+        ('namespace N { extern "C++" { extern int needle; } }', "declaration"),
+        ("/* extern */ int needle;", "definition"),
+        ('const char *note = "extern"; int needle;', "definition"),
+    ],
+)
+async def test_symbol_storage_class_and_initializer_are_classified(tmp_path, declaration, kind):
+    func = "int entry(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": declaration + "\n" + func}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+    )
+    result = await adapters.find_symbol(prepared.snapshot_ref, "needle")
+    assert len(result.matches) == 1
+    line = declaration.count("\n") + 1
+    assert f"a.cpp:{line} {kind}" in result.scope
+
+
+@pytest.mark.parametrize("prefix", [" " * 20_000, '"' + r"\a" * 10_000 + '" '])
+def test_symbol_context_checks_cancellation_during_long_scan(prefix):
+    import re
+    import threading
+
+    from app.repository.locate import _symbol_contexts
+
+    class CancelDuringScan(threading.Event):
+        checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 3:
+                self.set()
+            return super().is_set()
+
+    text = prefix + "needle"
+    with pytest.raises(IntegrationError) as failure:
+        list(_symbol_contexts(text, re.finditer("needle", text), cancel_event=CancelDuringScan()))
     assert failure.value.code == "repository_cancelled"

@@ -454,3 +454,59 @@ async def test_comment_only_input_cannot_be_a_target_function(tmp_path, func):
             )
         )
     assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_cancelled_materialization_exits_before_returning_and_never_publishes(
+    tmp_path, monkeypatch, cached, timeout
+):
+    import asyncio
+    import threading
+
+    func = "int f(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": func}}})
+    if cached:
+        fake.fetched.add(REPO)
+    adapters = build_adapters(tmp_path, fake)
+    started, stopped, release = (threading.Event() for _ in range(3))
+    observed = []
+
+    def paused_export(handle, commit, destination, *, cancel_event=None):
+        observed.append(cancel_event)
+        (destination / "a.c").write_text(func, encoding="utf-8")
+        started.set()
+        try:
+            while not release.wait(0.005):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+            return 1
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(fake, "export", paused_export)
+    request = SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    deadline = asyncio.timeout(None)
+
+    async def prepare():
+        if timeout:
+            async with deadline:
+                return await adapters.prepare_snapshot(request)
+        return await adapters.prepare_snapshot(request)
+
+    task = asyncio.create_task(prepare())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if timeout:
+            deadline.reschedule(asyncio.get_running_loop().time())
+        else:
+            task.cancel()
+        with pytest.raises(TimeoutError if timeout else asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        assert observed[0] is not None and observed[0].is_set()
+        assert stopped.is_set()
+        assert not adapters.store.exists(adapters.store.ref_for(REPO, COMMIT))
+        assert list(adapters.store.temp.iterdir()) == []
+    finally:
+        release.set()
+        assert await asyncio.to_thread(stopped.wait, 2)

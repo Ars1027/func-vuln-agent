@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from stat import S_ISREG
 
 from app.schemas.paths import normalize_snapshot_path
 from app.schemas.ports import IntegrationError
@@ -91,12 +92,14 @@ class SnapshotStore:
         root: str | Path,
         *,
         max_total_bytes: int | None = 2 * 1024**3,
+        max_total_entries: int | None = 200_000,
     ) -> None:
         self.root = Path(root)
         self.snapshots = self.root / "snapshots"
         self.refs = self.root / "refs"
         self.temp = self.root / "tmp"
         self.max_total_bytes = max_total_bytes
+        self.max_total_entries = max_total_entries
         self._publish_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         # 引用没有到期/释放协议，已发布快照可能仍被排队或运行中的任务使用。
@@ -144,23 +147,37 @@ class SnapshotStore:
             except OSError:
                 continue
 
-    def publish(self, staged: Path, snapshot_ref: str, *, repo_url: str, commit: str) -> None:
+    def publish(
+        self,
+        staged: Path,
+        snapshot_ref: str,
+        *,
+        repo_url: str,
+        commit: str,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         """按引用串行发布文件树；元数据先写，重试可修复孤儿目录。"""
         with self._publish_lock(snapshot_ref):
+            check_scan_cancelled(cancel_event)
             if self.exists(snapshot_ref):
                 shutil.rmtree(staged, ignore_errors=True)
                 return
             destination = self.snapshots / snapshot_ref
             destination.parent.mkdir(parents=True, exist_ok=True)
-            # 只有元数据存在时该目录才可用，因此无元数据的目录是上次中断的残留。
-            if destination.exists():
-                shutil.rmtree(destination, ignore_errors=True)
-            size = _directory_size(staged)
+            size, entries = _directory_usage(staged, cancel_event=cancel_event)
             # 配额检查、登记和可见性切换共用一把锁，不重复统计在途预留。
             with self._quota_lock:
+                check_scan_cancelled(cancel_event)
+                # 无元数据的目录是中断残留；清理也与其他发布的配额扫描串行。
+                if destination.exists():
+                    shutil.rmtree(destination)
+                (self.refs / f"{snapshot_ref}.json").unlink(missing_ok=True)
+                used_bytes, used_entries = self._snapshot_usage(cancel_event=cancel_event)
                 if (
-                    self.max_total_bytes is not None
-                    and self._snapshot_bytes() + size > self.max_total_bytes
+                    self.max_total_bytes is not None and used_bytes + size > self.max_total_bytes
+                ) or (
+                    self.max_total_entries is not None
+                    and used_entries + entries + 1 > self.max_total_entries
                 ):
                     raise IntegrationError("storage_quota_exceeded", "快照存储配额已用尽。")
                 self._write_metadata(snapshot_ref, repo_url, commit)
@@ -185,12 +202,12 @@ class SnapshotStore:
             temporary.unlink(missing_ok=True)
             raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
 
-    def _snapshot_bytes(self) -> int:
-        if not self.refs.is_dir():
-            return 0
-        return sum(
-            _directory_size(self.snapshots / path.stem) for path in self.refs.glob("snap-*.json")
-        )
+    def _snapshot_usage(self, *, cancel_event: threading.Event | None = None) -> tuple[int, int]:
+        """扫描落盘状态，包含孤儿树；元数据占用条目，源码计逻辑字节。"""
+        size, tree_entries = _directory_usage(self.snapshots, cancel_event=cancel_event)
+        _, ref_entries = _directory_usage(self.refs, cancel_event=cancel_event)
+        # 两个固定容器目录不计入每份快照的条目配额。
+        return size, max(0, tree_entries - 1) + max(0, ref_entries - 1)
 
     def resolve_file(self, snapshot_ref: str, path: str) -> tuple[str, Path]:
         """返回规范化相对路径与磁盘路径；解析符号链接后仍须位于快照内。"""
@@ -230,8 +247,10 @@ class SnapshotStore:
         *,
         max_lines: int,
         max_bytes: int = 2 * 1024 * 1024,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[list[str], int, bool]:
         """只读取请求的行区间；返回 (行内容, 实际结束行, 是否提前遇到文件末尾)。"""
+        check_scan_cancelled(cancel_event)
         try:
             if path.stat().st_size > max_bytes:
                 raise IntegrationError("file_too_large", f"单文件读取上限为 {max_bytes} 字节。")
@@ -241,6 +260,7 @@ class SnapshotStore:
         with raw:
             try:
                 while chunk := raw.read(8192):
+                    check_scan_cancelled(cancel_event)
                     if b"\x00" in chunk:
                         raise IntegrationError("file_unreadable", "该文件不是文本文件。")
             except OSError as exc:
@@ -249,17 +269,20 @@ class SnapshotStore:
             stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n")
             try:
                 for _ in range(start_line - 1):
+                    check_scan_cancelled(cancel_event)
                     if not stream.readline():
                         raise IntegrationError("line_out_of_range", "起始行超出文件末尾。")
                 wanted = end_line - start_line + 1
                 lines: list[str] = []
                 for _ in range(min(wanted, max_lines + 1)):
+                    check_scan_cancelled(cancel_event)
                     line = stream.readline()
                     if not line:
                         break
                     lines.append(line.removesuffix("\r\n").removesuffix("\n"))
             except UnicodeDecodeError as exc:
                 raise IntegrationError("file_unreadable", "该文件不是 UTF-8 文本。") from exc
+        check_scan_cancelled(cancel_event)
         if not lines:
             raise IntegrationError("line_out_of_range", "起始行超出文件末尾。")
         if len(lines) > max_lines:
@@ -339,12 +362,18 @@ def _looks_like_source(path: Path, preview_bytes: int = 4096) -> bool:
     return bool(_SOURCE_DIRECTIVE.search(text))
 
 
-def _directory_size(path: Path) -> int:
+def _directory_usage(path: Path, *, cancel_event: threading.Event | None = None) -> tuple[int, int]:
+    """返回逻辑字节与文件系统条目数，空文件、目录和根目录也占条目。"""
+    check_scan_cancelled(cancel_event)
+    if not path.exists():
+        return 0, 0
     total = 0
+    entries = 1
     for file in path.rglob("*"):
-        try:
-            if file.is_file():
-                total += file.stat().st_size
-        except OSError:
-            continue
-    return total
+        check_scan_cancelled(cancel_event)
+        file_stat = file.stat()
+        entries += 1
+        if S_ISREG(file_stat.st_mode):
+            total += file_stat.st_size
+    check_scan_cancelled(cancel_event)
+    return total, entries

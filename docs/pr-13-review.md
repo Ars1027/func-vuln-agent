@@ -51,3 +51,29 @@
 
 当前主机为 Windows，进程树终止与只读 Git pack 清理已实测；POSIX 的进程组路径
 未在本机运行。多进程共用存储仍需单写入服务，镜像下载的瞬时磁盘峰值仍需部署侧硬配额。
+
+## 后续轮次复核
+
+本轮代码基线为 `7bc56b2f27bb448235989edb6d6c214cc0a59b96`，累计核对 59 条审核讨论。
+前 51 条沿用上表逐项确认；新增 8 条及其处理如下。讨论是否关闭、是否过期均不替代代码验证。
+
+| 原意见 | 当前实现 |
+| --- | --- |
+| [函数定位不随取消停止](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302370162) | 已覆盖；本轮把工作线程取消与等待退出提取为共用实现，取消不会提前释放调用方并发名额。 |
+| [注释中的函数被接受](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302370166) | 已覆盖；排除注释/字符串中的候选，保留函数原文与合法注释，覆盖 C/C++ 续行和被续行拆开的注释分隔符。 |
+| [搜索返回重复行](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302370170) | 已覆盖；按路径/行区间去重，出现次数及预算仍逐次统计。 |
+| [大量小文件绕过快照配额](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302475662) | 修复：字节配额之外新增全局 200000 条目上限，计入文件、目录、快照根与元数据；重启从磁盘重算，并计入孤儿树和元数据。配额检查、孤儿清理与发布串行。 |
+| [搜索和符号查询取消后仍运行](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302475664) | 修复：所有仓库工具及本地/网络物化均传递取消事件并等待线程退出；遍历、归一化、符号上下文、按行读取和发布配额扫描检查取消。 |
+| [符号结果重复挤占候选](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302475666) | 修复：各优先级在限额前去重，返回前合并同一位置的不同分类并保留最高优先级；出现次数和字节预算不变。 |
+| [extern 变量声明被当作定义](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302475667) | 修复：无初始化的 extern 标量/数组为声明，带等号或花括号初始化的变量为定义；处理多行声明、同句多个变量、注释中的关键词及 C/C++ 链接块。 |
+| [流式 Popen 通用审计](https://github.com/Ars1027/func-vuln-agent/pull/13#discussion_r4302349602) | 已核查 argv 列表和 shell=False，补齐局部审计注释；不添加会改写参数内容的 Shell 转义。 |
+
+同类失败路径也补齐：Git 管道写入、刷新、读取及异常响应返回 `snapshot_export_failed`；
+清理已退出子进程的管道时，关闭刷新错误不会覆盖原始失败或取消，目标文件写盘错误仍独立处理。
+镜像拉取期间的全量配额扫描至多每秒一次，拉取前后检查继续保留。
+
+本轮验证使用合成源码、本地临时 Git 仓库和实际子进程，不访问课程数据：
+
+- `uv run --frozen pytest -q --tb=short`：284 passed（本轮新增 68 个用例）。
+- `uv run --frozen ruff check backend tests`：通过。
+- `uv run --frozen ruff format --check backend tests`：通过。

@@ -60,6 +60,7 @@ _SCRUBBED_ENV = (
 _SCRUBBED_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 _VERSION = re.compile(r"(\d+)\.(\d+)")
 _MIN_PINNED_GIT = (2, 31)
+_QUOTA_CHECK_INTERVAL = 1.0
 
 
 class GitClient(Protocol):
@@ -240,14 +241,18 @@ class SubprocessGitClient:
             raise IntegrationError(
                 "git_unavailable", "服务器未安装 Git，无法获取代码快照。"
             ) from exc
+        next_quota_check = 0.0
         try:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
                     raise IntegrationError("repository_fetch_timeout", "获取代码快照超时。")
-                if quota_path is not None:
+                if quota_path is not None and now >= next_quota_check:
+                    # 全量目录扫描至多每秒一次，不跟随 200ms 的进程通信轮询。
+                    next_quota_check = now + _QUOTA_CHECK_INTERVAL
                     self._enforce_mirror_quota(keep=quota_path, remove_keep=False)
                 try:
                     stdout, stderr = process.communicate(timeout=min(0.2, remaining))
@@ -295,6 +300,8 @@ class SubprocessGitClient:
         cancel_event: threading.Event | None = None,
     ) -> Iterator[subprocess.Popen]:
         """流式读管道时由独立监视线程执行取消/超时，阻塞 read 也能被中断。"""
+        # 参数均为程序生成的固定列表，未使用 shell；提交哈希与主机构成已校验。
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         process = subprocess.Popen(
             [self.executable, *self.options, *args],
             env=self._environment(),
@@ -340,10 +347,13 @@ class SubprocessGitClient:
             self._kill_process(process)
             process.wait()
             watcher.join()
-            if process.stdin is not None:
-                process.stdin.close()
-            if process.stdout is not None:
-                process.stdout.close()
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        # 已退出子进程的 stdin.close() 也会刷新缓冲，不能覆盖原始失败。
+                        pass
 
     def _run(
         self,
@@ -593,18 +603,34 @@ class SubprocessGitClient:
                             "snapshot_export_failed", "提交包含跨平台冲突的路径。"
                         )
                     paths[canonical] = prefix
-                process.stdin.write(sha.encode("ascii") + b"\n")
-                process.stdin.flush()
-                header = process.stdout.readline()
-                fields = header.split()
+                try:
+                    process.stdin.write(sha.encode("ascii") + b"\n")
+                    process.stdin.flush()
+                    fields = process.stdout.readline().split()
+                except (OSError, ValueError) as exc:
+                    raise IntegrationError(
+                        "snapshot_export_failed", "读取快照文件内容失败。"
+                    ) from exc
                 if len(fields) != 3 or fields[1] != b"blob":
                     raise IntegrationError("snapshot_export_failed", "读取快照文件内容失败。")
-                size = int(fields[2])
+                try:
+                    size = int(fields[2])
+                except ValueError as exc:
+                    raise IntegrationError(
+                        "snapshot_export_failed", "读取快照文件内容失败。"
+                    ) from exc
+                if size < 0:
+                    raise IntegrationError("snapshot_export_failed", "读取快照文件内容失败。")
                 if size > self.max_bytes or total + size > self.max_bytes:
                     raise IntegrationError("snapshot_too_large", "指定版本快照体积超出上限。")
-                data = process.stdout.read(size)
-                process.stdout.read(1)  # 结尾换行
-                if len(data) != size:
+                try:
+                    data = process.stdout.read(size)
+                    terminator = process.stdout.read(1)
+                except (OSError, ValueError) as exc:
+                    raise IntegrationError(
+                        "snapshot_export_failed", "读取快照文件内容失败。"
+                    ) from exc
+                if len(data) != size or terminator != b"\n":
                     raise IntegrationError("snapshot_export_failed", "读取快照文件内容失败。")
                 target = (root / relative).resolve()
                 if not target.is_relative_to(root):
@@ -629,7 +655,15 @@ class SubprocessGitClient:
         ) as process:
             assert process.stdout is not None
             pending = b""
-            while chunk := process.stdout.read1(4096):
+            while True:
+                try:
+                    chunk = process.stdout.read1(4096)
+                except (OSError, ValueError) as exc:
+                    raise IntegrationError(
+                        "snapshot_export_failed", "读取指定版本文件树失败。"
+                    ) from exc
+                if not chunk:
+                    break
                 pending += chunk
                 while b"\0" in pending:
                     record, pending = pending.split(b"\0", 1)
@@ -642,7 +676,17 @@ class SubprocessGitClient:
                         continue
                     if len(entries) >= self.max_files:
                         raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
-                    entries.append((sha.decode("ascii"), raw_path))
+                    try:
+                        object_id = sha.decode("ascii")
+                    except UnicodeDecodeError as exc:
+                        raise IntegrationError(
+                            "snapshot_export_failed", "读取指定版本文件树失败。"
+                        ) from exc
+                    if len(object_id) != 40 or any(
+                        character not in "0123456789abcdef" for character in object_id
+                    ):
+                        raise IntegrationError("snapshot_export_failed", "读取指定版本文件树失败。")
+                    entries.append((object_id, raw_path))
                 if len(pending) > 65536:
                     raise IntegrationError("snapshot_export_failed", "提交中的文件路径过长。")
             if pending or process.wait() != 0:

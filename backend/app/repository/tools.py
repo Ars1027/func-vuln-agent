@@ -5,11 +5,11 @@
 路径越界等执行问题抛 `IntegrationError`，两者不互相替代。
 """
 
-import asyncio
 import threading
 
 from app.repository.locate import find_symbol, locate_function, search_code
 from app.repository.store import SnapshotStore
+from app.repository.workers import run_cancellable
 from app.schemas.models import CodeLocation, RepositoryResult
 from app.schemas.ports import IntegrationError
 
@@ -31,25 +31,10 @@ class RepositoryTools:
         self.max_file_bytes = max_file_bytes
 
     async def locate_function(self, snapshot_ref: str, func: str) -> CodeLocation:
-        cancel = threading.Event()
-        worker = asyncio.create_task(
-            asyncio.to_thread(self._locate_function, snapshot_ref, func, cancel)
-        )
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancel.set()
-            # 线程退出后再传播取消，调用方不会提前释放并发名额。
-            cleanup = asyncio.gather(worker, return_exceptions=True)
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
-            raise
+        return await run_cancellable(self._locate_function, snapshot_ref, func)
 
     async def search_code(self, snapshot_ref: str, query: str) -> RepositoryResult:
-        return await asyncio.to_thread(self._search_code, snapshot_ref, query)
+        return await run_cancellable(self._search_code, snapshot_ref, query)
 
     async def read_file(
         self,
@@ -58,21 +43,24 @@ class RepositoryTools:
         start_line: int,
         end_line: int,
     ) -> RepositoryResult:
-        return await asyncio.to_thread(self._read_file, snapshot_ref, path, start_line, end_line)
+        return await run_cancellable(self._read_file, snapshot_ref, path, start_line, end_line)
 
     async def find_symbol(self, snapshot_ref: str, symbol: str) -> RepositoryResult:
-        return await asyncio.to_thread(self._find_symbol, snapshot_ref, symbol)
+        return await run_cancellable(self._find_symbol, snapshot_ref, symbol)
 
     def _locate_function(
         self,
         snapshot_ref: str,
         func: str,
+        *,
         cancel_event: threading.Event,
     ) -> CodeLocation:
         self.store.snapshot_dir(snapshot_ref)
         return locate_function(self.store, snapshot_ref, func, cancel_event=cancel_event)
 
-    def _search_code(self, snapshot_ref: str, query: str) -> RepositoryResult:
+    def _search_code(
+        self, snapshot_ref: str, query: str, *, cancel_event: threading.Event
+    ) -> RepositoryResult:
         self.store.snapshot_dir(snapshot_ref)
         return search_code(
             self.store,
@@ -80,9 +68,12 @@ class RepositoryTools:
             query,
             limit=self.search_limit,
             max_file_bytes=self.max_file_bytes,
+            cancel_event=cancel_event,
         )
 
-    def _find_symbol(self, snapshot_ref: str, symbol: str) -> RepositoryResult:
+    def _find_symbol(
+        self, snapshot_ref: str, symbol: str, *, cancel_event: threading.Event
+    ) -> RepositoryResult:
         self.store.snapshot_dir(snapshot_ref)
         return find_symbol(
             self.store,
@@ -90,6 +81,7 @@ class RepositoryTools:
             symbol,
             limit=self.symbol_limit,
             max_file_bytes=self.max_file_bytes,
+            cancel_event=cancel_event,
         )
 
     def _read_file(
@@ -98,6 +90,8 @@ class RepositoryTools:
         path: str,
         start_line: int,
         end_line: int,
+        *,
+        cancel_event: threading.Event,
     ) -> RepositoryResult:
         if (
             not isinstance(path, str)
@@ -115,6 +109,7 @@ class RepositoryTools:
             end_line,
             max_lines=self.max_read_lines,
             max_bytes=self.max_file_bytes,
+            cancel_event=cancel_event,
         )
         content = "\n".join(lines)
         scope = f"lines {start_line}-{actual_end} in {relative}"

@@ -177,7 +177,7 @@ def test_read_text_rejects_binary_and_invalid_utf8(tmp_path):
 def test_concurrent_publications_that_fit_do_not_double_count(tmp_path, monkeypatch):
     from app.repository import store as store_module
 
-    store = SnapshotStore(tmp_path / "storage", max_total_bytes=20)
+    store = SnapshotStore(tmp_path / "storage", max_total_bytes=20, max_total_entries=6)
     first_visible = threading.Event()
     release_first = threading.Event()
     failures = []
@@ -281,3 +281,135 @@ def test_scan_checks_cancellation_while_skipping_non_source_files(tmp_path, monk
         list(store.iter_files(ref, cancel_event=cancel))
     assert failure.value.code == "repository_cancelled"
     assert visited == {"a.txt"}
+
+
+@pytest.mark.parametrize("byte_limit", [None, 1000])
+def test_empty_files_consume_global_entry_quota_after_restart(tmp_path, byte_limit):
+    root = tmp_path / "storage"
+    store = SnapshotStore(root, max_total_bytes=byte_limit, max_total_entries=5)
+    old, new = (store.ref_for(REPO, str(index) * 40) for index in (1, 2))
+    staged = store.new_temp_dir()
+    for index in range(3):
+        (staged / f"{index}.c").touch()
+    store.publish(staged, old, repo_url=REPO, commit="1" * 40)
+
+    restarted = SnapshotStore(root, max_total_bytes=byte_limit, max_total_entries=5)
+    assert restarted.exists(old)
+    with pytest.raises(IntegrationError) as failure:
+        restarted.publish(stage(restarted, content=""), new, repo_url=REPO, commit="2" * 40)
+    assert failure.value.code == "storage_quota_exceeded"
+    assert not restarted.exists(new)
+    assert not (restarted.refs / f"{new}.json").exists()
+    # 已发布引用重试不再消耗条目；旧引用继续可读。
+    restarted.publish(stage(restarted, content=""), old, repo_url=REPO, commit="1" * 40)
+    assert len(list(restarted.snapshot_dir(old).glob("*.c"))) == 3
+
+
+def test_nested_directories_consume_entry_quota(tmp_path):
+    store = SnapshotStore(tmp_path / "storage", max_total_entries=4)
+    staged = store.new_temp_dir()
+    nested = staged / "a" / "b"
+    nested.mkdir(parents=True)
+    (nested / "empty.c").touch()
+    ref = store.ref_for(REPO, "1" * 40)
+    # 根目录 + 两层目录 + 空文件 + 元数据，共 5 个条目。
+    with pytest.raises(IntegrationError) as failure:
+        store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+    assert failure.value.code == "storage_quota_exceeded"
+    assert not store.exists(ref)
+
+
+def test_orphan_trees_consume_quota_and_can_be_repaired(tmp_path):
+    store = SnapshotStore(tmp_path / "storage", max_total_entries=4)
+    orphan_ref, new_ref = (store.ref_for(REPO, str(index) * 40) for index in (1, 2))
+    orphan = store.snapshots / orphan_ref
+    orphan.mkdir(parents=True)
+    (orphan / "empty.c").touch()
+    with pytest.raises(IntegrationError) as failure:
+        store.publish(stage(store, content=""), new_ref, repo_url=REPO, commit="2" * 40)
+    assert failure.value.code == "storage_quota_exceeded"
+    assert not store.exists(new_ref)
+
+    store.publish(stage(store, "fresh.c", ""), orphan_ref, repo_url=REPO, commit="1" * 40)
+    assert store.exists(orphan_ref)
+    assert not (orphan / "empty.c").exists()
+    assert (orphan / "fresh.c").is_file()
+
+
+def test_orphan_metadata_consumes_quota_without_double_counting_repair(tmp_path):
+    store = SnapshotStore(tmp_path / "storage", max_total_entries=3)
+    orphan_ref, new_ref = (store.ref_for(REPO, str(index) * 40) for index in (1, 2))
+    store._write_metadata(orphan_ref, REPO, "1" * 40)
+    with pytest.raises(IntegrationError) as failure:
+        store.publish(stage(store, content=""), new_ref, repo_url=REPO, commit="2" * 40)
+    assert failure.value.code == "storage_quota_exceeded"
+
+    store.publish(stage(store, content=""), orphan_ref, repo_url=REPO, commit="1" * 40)
+    assert store.exists(orphan_ref)
+
+
+def test_concurrent_empty_snapshots_respect_global_entry_quota(tmp_path):
+    store = SnapshotStore(tmp_path / "storage", max_total_bytes=None, max_total_entries=3)
+    refs = [store.ref_for(REPO, str(index) * 40) for index in (1, 2)]
+    ready = threading.Barrier(2)
+    outcomes = []
+
+    def publish(ref):
+        staged = stage(store, content="")
+        ready.wait(timeout=5)
+        try:
+            store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+            outcomes.append("ok")
+        except IntegrationError as exc:
+            outcomes.append(exc.code)
+
+    threads = [threading.Thread(target=publish, args=(ref,)) for ref in refs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(outcomes) == ["ok", "storage_quota_exceeded"]
+    assert sum(store.exists(ref) for ref in refs) == 1
+
+
+def test_read_lines_checks_cancellation_during_binary_scan(tmp_path):
+    store = SnapshotStore(tmp_path / "storage")
+    path = tmp_path / "long.c"
+    path.write_bytes(b"x" * 30_000)
+
+    class CancelDuringRead(threading.Event):
+        checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 3:
+                self.set()
+            return super().is_set()
+
+    with pytest.raises(IntegrationError) as failure:
+        store.read_lines(path, 1, 1, max_lines=10, cancel_event=CancelDuringRead())
+    assert failure.value.code == "repository_cancelled"
+
+
+def test_cancelled_quota_scan_cannot_publish_a_snapshot(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    staged = stage(store)
+    cancel = threading.Event()
+    original_stat = Path.stat
+
+    def cancel_after_file_stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == staged / "a.c":
+            cancel.set()
+        return result
+
+    monkeypatch.setattr(Path, "stat", cancel_after_file_stat)
+    with pytest.raises(IntegrationError) as failure:
+        store.publish(staged, ref, repo_url=REPO, commit="1" * 40, cancel_event=cancel)
+    assert failure.value.code == "repository_cancelled"
+    assert not store.exists(ref)
+    assert not (store.refs / f"{ref}.json").exists()
