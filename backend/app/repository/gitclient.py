@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -95,6 +96,16 @@ class GitClient(Protocol):
         *,
         cancel_event: threading.Event | None = None,
     ) -> int: ...
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    """子进程执行结果，避免依赖 `CompletedProcess` 构造函数。"""
+
+    args: list[str]
+    returncode: int
+    stdout: str | bytes
+    stderr: str | bytes
 
 
 class _GitFailure(IntegrationError):
@@ -198,7 +209,7 @@ class SubprocessGitClient:
         options: tuple[str, ...] | None = None,
         cancel_event: threading.Event | None = None,
         text: bool = True,
-    ) -> subprocess.CompletedProcess:
+    ) -> _CommandResult:
         command = [self.executable, *(options or self.options), *args]
         deadline = time.monotonic() + self.timeout_seconds
         try:
@@ -233,7 +244,7 @@ class SubprocessGitClient:
                 break
             except subprocess.TimeoutExpired:
                 continue
-        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        return _CommandResult(command, process.returncode, stdout, stderr)
 
     def _run(
         self,
@@ -410,6 +421,8 @@ class SubprocessGitClient:
             raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
         destination.mkdir(parents=True, exist_ok=True)
         root = destination.resolve()
+        # 命令由固定子命令与已校验的镜像句柄组成，未使用 shell。
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         process = subprocess.Popen(
             [self.executable, *self.options, "-C", str(handle), "cat-file", "--batch"],
             env=self._environment(),
