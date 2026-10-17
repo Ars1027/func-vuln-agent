@@ -25,6 +25,7 @@ export const ERROR_CODE_LABELS: Record<string, string> = {
   invalid_request: "请求参数不合法",
   task_not_found: "任务不存在",
   invalid_sequence: "事件序号不合法",
+  idx_not_representable: "样本标识超出可无损表示的范围",
   internal_error: "服务内部错误",
   // 批量上传
   invalid_jsonl: "JSONL 格式不正确",

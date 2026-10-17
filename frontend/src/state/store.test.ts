@@ -127,6 +127,27 @@ describe("taskReducer 快照", () => {
     expect(next.seq).toBe(9);
     expect(sampleList(next)).toHaveLength(0);
   });
+
+  it("只在 failures 里的样本补成失败态，不丢项也不少计失败", () => {
+    const interrupted: ReportsSnapshot = {
+      task_id: "task-1",
+      seq: 3,
+      reports: [],
+      // abort() 为仍在排队的输入只写 failures，没有对应的 failed_samples。
+      active_samples: [],
+      failed_samples: [],
+      failures: [{ idx: "queued-1", code: "interrupted", message: "任务被服务重启中断" }],
+    };
+    const next = taskReducer(createInitialTaskState(), {
+      type: "snapshot",
+      snapshot: interrupted,
+    });
+
+    expect(next.order).toEqual(["s:queued-1"]);
+    expect(next.samples["s:queued-1"].status).toBe("failed");
+    expect(next.samples["s:queued-1"].failure?.code).toBe("interrupted");
+    expect(taskProgress(next)).toEqual({ total: 0, completed: 0, failed: 1, running: 0 });
+  });
 });
 
 describe("taskReducer 事件", () => {

@@ -8,6 +8,8 @@ import { ErrorNotice } from "./ErrorNotice";
 interface Props {
   mode: Mode;
   disabled?: boolean;
+  /** 提交开始/结束时通知容器，容器据此锁定输入方式切换。 */
+  onPendingChange?: (pending: boolean) => void;
   onStarted: (view: TaskView) => void;
 }
 
@@ -22,7 +24,7 @@ function formatSize(bytes: number): string {
 }
 
 /** 批量输入：上传课程 JSONL，字段名为 file，模式随表单提交。 */
-export function BatchUploadForm({ mode, disabled, onStarted }: Props) {
+export function BatchUploadForm({ mode, disabled, onPendingChange, onStarted }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
@@ -36,6 +38,7 @@ export function BatchUploadForm({ mode, disabled, onStarted }: Props) {
       return;
     }
     setBusy(true);
+    onPendingChange?.(true);
     try {
       const view = await createBatch(file, mode);
       onStarted(view);
@@ -43,6 +46,7 @@ export function BatchUploadForm({ mode, disabled, onStarted }: Props) {
       setError(describeError(submitError));
     } finally {
       setBusy(false);
+      onPendingChange?.(false);
     }
   }
 

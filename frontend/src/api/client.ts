@@ -48,6 +48,39 @@ async function readError(response: Response): Promise<ApiError> {
   return new ApiError(response.status, code, message);
 }
 
+/**
+ * 递归找出无法被 `JSON.parse` 无损表示的整数 `idx`。
+ *
+ * 后端 `idx` 是 `StrictInt | str`，未限制在 JavaScript 安全整数范围内；而 `JSON.parse`
+ * 会把 9007199254740993 这类字面量四舍五入，两个不同样本就会得到同一个数字并被界面合并，
+ * 报告与事件串到错误的样本上。这里宁可报错，也不接受已经失真的标识。
+ */
+function findUnrepresentableIdx(value: unknown, path = "response"): string | null {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = findUnrepresentableIdx(value[index], `${path}[${index}]`);
+      if (found !== null) {
+        return found;
+      }
+    }
+    return null;
+  }
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const next = `${path}.${key}`;
+    if (key === "idx" && typeof item === "number" && !Number.isSafeInteger(item)) {
+      return next;
+    }
+    const found = findUnrepresentableIdx(item, next);
+    if (found !== null) {
+      return found;
+    }
+  }
+  return null;
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
@@ -59,7 +92,16 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     throw await readError(response);
   }
-  return (await response.json()) as T;
+  const body: unknown = await response.json();
+  const idxPath = findUnrepresentableIdx(body);
+  if (idxPath !== null) {
+    throw new ApiError(
+      response.status,
+      "idx_not_representable",
+      `响应中 ${idxPath} 的整数标识超出 JavaScript 安全整数范围（±2^53-1），浏览器无法无损表示，可能把不同样本合并；请改用字符串标识或缩小取值。`,
+    );
+  }
+  return body as T;
 }
 
 /** POST /api/snapshots：按 commit_url 与 revision 准备单版本快照。 */

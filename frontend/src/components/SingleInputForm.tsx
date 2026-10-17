@@ -10,6 +10,8 @@ import { ErrorNotice } from "./ErrorNotice";
 interface Props {
   mode: Mode;
   disabled?: boolean;
+  /** 提交开始/结束时通知容器，容器据此锁定输入方式切换。 */
+  onPendingChange?: (pending: boolean) => void;
   onStarted: (view: TaskView) => void;
 }
 
@@ -17,7 +19,7 @@ interface Props {
  * 单样本输入：函数 + 修复提交链接 + 明确的版本选择。
  * 先 POST /api/snapshots 准备快照，再用返回的 idx/func/snapshot_ref 提交检测。
  */
-export function SingleInputForm({ mode, disabled, onStarted }: Props) {
+export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: Props) {
   const [idxText, setIdxText] = useState("manual-1");
   const [idxKind, setIdxKind] = useState<IdxInputKind>("string");
   const [func, setFunc] = useState("");
@@ -60,6 +62,7 @@ export function SingleInputForm({ mode, disabled, onStarted }: Props) {
     }
 
     setBusy(true);
+    onPendingChange?.(true);
     try {
       const snapshot = await createSnapshot({
         idx,
@@ -79,6 +82,7 @@ export function SingleInputForm({ mode, disabled, onStarted }: Props) {
       setError(describeError(submitError));
     } finally {
       setBusy(false);
+      onPendingChange?.(false);
     }
   }
 

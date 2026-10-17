@@ -338,6 +338,10 @@ function applySnapshot(state: TaskState, snapshot: ReportsSnapshot): TaskState {
     const sample = samples[key];
     if (sample) {
       samples[key] = { ...sample, failure };
+    } else {
+      // 服务重启后 abort() 会给没有 active_json 的排队输入只留下 failures 记录，
+      // 没有对应的 failed_samples；这里补一个失败态样本，避免漏项与失败计数偏小。
+      push({ ...createSample(failure.idx, "failed"), failure });
     }
   }
   return {

@@ -33,6 +33,8 @@ export function useTaskStream(): TaskStreamController {
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const closeStream = useRef<(() => void) | null>(null);
   const startedAtRef = useRef<number | null>(null);
+  /** 每次连接自增；先发起但晚返回的请求不再改动状态，避免并发提交互相覆盖。 */
+  const runId = useRef(0);
 
   const detach = useCallback(() => {
     closeStream.current?.();
@@ -55,22 +57,40 @@ export function useTaskStream(): TaskStreamController {
   }, []);
 
   const connect = useCallback(
-    async (taskId: string, options: { reset?: boolean } = {}) => {
+    async (taskId: string, options: { accepted?: TaskView } = {}) => {
       detach();
-      if (options.reset) {
+      runId.current += 1;
+      const currentRun = runId.current;
+      const isCurrent = () => runId.current === currentRun;
+      if (options.accepted) {
         dispatch({ type: "reset" });
         clearStarted();
+        // 先保存已受理的任务：随后读取快照或状态失败时 task_id 仍在，
+        // 界面不会退回空状态，用户可以直接重试并续接到这个已经在跑的任务。
+        dispatch({ type: "task_view", view: options.accepted });
       }
       setLoadError(null);
       setLoading(true);
       try {
-        const view = await getTask(taskId);
-        dispatch({ type: "task_view", view });
+        // 先取快照的 seq，再取任务状态：状态不会早于快照，
+        // 因此“已终止”判断能覆盖快照之后的终态。
         const snapshot = await getReports(taskId);
+        if (!isCurrent()) {
+          return;
+        }
         dispatch({ type: "snapshot", snapshot });
+        const view = await getTask(taskId);
+        if (!isCurrent()) {
+          return;
+        }
+        dispatch({ type: "task_view", view });
+        if (view.status === "completed" || view.status === "failed") {
+          // 快照已包含终止事件：服务端会立即结束这条流，浏览器随后反复重连。
+          dispatch({ type: "connection", connection: "closed" });
+          return;
+        }
         dispatch({ type: "connection", connection: "connecting" });
-        const initialSeq = snapshot.seq;
-        closeStream.current = subscribeTaskEvents(taskId, initialSeq, {
+        closeStream.current = subscribeTaskEvents(taskId, snapshot.seq, {
           onEvent: (event) => {
             markStarted();
             dispatch({ type: "event", event });
@@ -84,10 +104,15 @@ export function useTaskStream(): TaskStreamController {
             dispatch({ type: "notice", notice: "收到无法解析的事件数据，已跳过该条记录。" }),
         });
       } catch (error) {
+        if (!isCurrent()) {
+          return;
+        }
         setLoadError(describeError(error));
         dispatch({ type: "connection", connection: "error" });
       } finally {
-        setLoading(false);
+        if (isCurrent()) {
+          setLoading(false);
+        }
       }
     },
     [clearStarted, detach, markStarted],
@@ -95,7 +120,7 @@ export function useTaskStream(): TaskStreamController {
 
   const startTask = useCallback(
     (view: TaskView) => {
-      void connect(view.task_id, { reset: true });
+      void connect(view.task_id, { accepted: view });
     },
     [connect],
   );
@@ -132,8 +157,14 @@ export function useTaskStream(): TaskStreamController {
 
   const clearDownloadError = useCallback(() => setDownloadError(null), []);
 
-  // 组件卸载时关闭事件流。
-  useEffect(() => detach, [detach]);
+  // 组件卸载时关闭事件流，并让在途请求的结果失效。
+  useEffect(
+    () => () => {
+      runId.current += 1;
+      detach();
+    },
+    [detach],
+  );
 
   return {
     state,

@@ -16,6 +16,9 @@ interface Props {
 
 export function InputPanel({ mode, onModeChange, disabled, onStarted }: Props) {
   const [tab, setTab] = useState<Tab>("single");
+  // 任一表单正在提交时锁定切换：切走会卸载表单，但不会取消它已经在飞的请求，
+  // 两次提交都可能触发 onStarted，让任务流互相覆盖。
+  const [pending, setPending] = useState(false);
 
   return (
     <section className="panel">
@@ -27,11 +30,13 @@ export function InputPanel({ mode, onModeChange, disabled, onStarted }: Props) {
       )}
       <ModeSelect mode={mode} onChange={onModeChange} disabled={disabled} />
 
-      <div className="tabs" role="tablist">        <button
+      <div className="tabs" role="tablist">
+        <button
           type="button"
           role="tab"
           aria-selected={tab === "single"}
           className={`tab ${tab === "single" ? "is-active" : ""}`}
+          disabled={pending}
           onClick={() => setTab("single")}
         >
           单样本
@@ -41,16 +46,31 @@ export function InputPanel({ mode, onModeChange, disabled, onStarted }: Props) {
           role="tab"
           aria-selected={tab === "batch"}
           className={`tab ${tab === "batch" ? "is-active" : ""}`}
+          disabled={pending}
           onClick={() => setTab("batch")}
         >
           批量 JSONL
         </button>
       </div>
 
+      {pending && (
+        <p className="notice notice--info">提交请求处理中，完成前不能切换输入方式。</p>
+      )}
+
       {tab === "single" ? (
-        <SingleInputForm mode={mode} disabled={disabled} onStarted={onStarted} />
+        <SingleInputForm
+          mode={mode}
+          disabled={disabled}
+          onPendingChange={setPending}
+          onStarted={onStarted}
+        />
       ) : (
-        <BatchUploadForm mode={mode} disabled={disabled} onStarted={onStarted} />
+        <BatchUploadForm
+          mode={mode}
+          disabled={disabled}
+          onPendingChange={setPending}
+          onStarted={onStarted}
+        />
       )}
     </section>
   );
