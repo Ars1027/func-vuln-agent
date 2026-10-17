@@ -1,17 +1,18 @@
 """只读 Git 镜像缓存：拉取指定提交并导出为不含 `.git` 的文件树。
 
 不 checkout 工作区、不导出历史，也不在快照目录内保留 Git 元数据。
-所有命令禁用协议跳转与 HTTP 重定向，默认只允许 https 传输。
+所有命令禁用协议跳转与 HTTP 重定向，只允许 https 传输；准备层解析出的
+公网地址通过 `http.curloptResolve` 固定给 Git，避免二次解析造成重绑定。
 """
 
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
-import tarfile
-import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -46,25 +47,58 @@ _SCRUBBED_ENV = (
     "GIT_CONFIG",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
 )
+_SCRUBBED_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_VERSION = re.compile(r"(\d+)\.(\d+)")
+_MIN_PINNED_GIT = (2, 31)
 
 
 class GitClient(Protocol):
     """准备层依赖的最小 Git 能力；`handle` 为后端自有句柄。"""
 
-    def fetch(self, repo_url: str, commit: str) -> Any: ...
+    def local_mirror(self, repo_url: str) -> Any | None: ...
+
+    def has_commit(self, handle: Any, commit: str) -> bool: ...
+
+    def pinned_options(self, host: str, addresses: list[str]) -> tuple[str, ...]: ...
+
+    def fetch(
+        self,
+        repo_url: str,
+        commit: str,
+        *,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Any: ...
 
     def resolve(self, handle: Any, commit: str) -> str: ...
 
     def parents(self, handle: Any, commit: str) -> list[str]: ...
 
-    def ensure(self, handle: Any, commit: str) -> None: ...
+    def ensure(
+        self,
+        handle: Any,
+        commit: str,
+        *,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None: ...
 
-    def export(self, handle: Any, commit: str, destination: Path) -> int: ...
+    def export(
+        self,
+        handle: Any,
+        commit: str,
+        destination: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> int: ...
 
 
 class _GitFailure(IntegrationError):
-    """保留 stderr 供同一次操作内部区分可达性与提交缺失。"""
+    """保留 stderr 供同一次操作内部诊断。"""
 
     def __init__(self, code: str, message: str, stderr: str = "") -> None:
         super().__init__(code, message)
@@ -80,19 +114,24 @@ class SubprocessGitClient:
         *,
         executable: str | None = None,
         timeout_seconds: float = 300,
+        max_fetch_depth: int = 200,
         max_files: int = 200_000,
         max_bytes: int = 256 * 1024 * 1024,
+        max_total_bytes: int | None = 2 * 1024 * 1024 * 1024,
         allow_local_transport: bool = False,
     ) -> None:
         self.mirror_root = Path(mirror_root)
         self._executable = executable
         self.timeout_seconds = timeout_seconds
+        self.max_fetch_depth = max(1, max_fetch_depth)
         self.max_files = max_files
         self.max_bytes = max_bytes
+        self.max_total_bytes = max_total_bytes
         # 仅测试用：允许 file:// 与本地路径（生产环境保持 False）。
         self.allow_local_transport = allow_local_transport
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._version: tuple[int, int] | None = None
 
     # 每个镜像目录一把线程锁：并发的异步样本会在线程池里同时访问。
     def _lock_for(self, mirror: Path) -> threading.Lock:
@@ -114,8 +153,33 @@ class SubprocessGitClient:
             raise IntegrationError("git_unavailable", "服务器未安装 Git，无法获取代码快照。")
         return self._executable
 
+    def _git_version(self) -> tuple[int, int]:
+        if self._version is None:
+            completed = self._execute(["version"])
+            match = _VERSION.search(completed.stdout or "")
+            if match is None:
+                raise IntegrationError("git_unavailable", "无法识别 Git 版本。")
+            self._version = (int(match.group(1)), int(match.group(2)))
+        return self._version
+
+    def pinned_options(self, host: str, addresses: list[str]) -> tuple[str, ...]:
+        """把已验证的公网地址固定给 libcurl，避免连接时再次解析主机名。"""
+        if not addresses:
+            raise IntegrationError("network_unavailable", "未获得可用的托管主机地址。")
+        if self._git_version() < _MIN_PINNED_GIT:
+            raise IntegrationError(
+                "git_unsupported", "Git 版本过低，无法固定已验证的托管主机地址。"
+            )
+        resolved = ",".join(addresses)
+        return (*self.options, "-c", f"http.curloptResolve={host}:443:{resolved}")
+
     def _environment(self) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items() if key not in _SCRUBBED_ENV}
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in _SCRUBBED_ENV
+            and not any(key.startswith(prefix) for prefix in _SCRUBBED_ENV_PREFIXES)
+        }
         env.update(
             {
                 "GIT_TERMINAL_PROMPT": "0",
@@ -127,29 +191,59 @@ class SubprocessGitClient:
         )
         return env
 
-    def _execute(self, args: list[str]) -> subprocess.CompletedProcess:
-        command = [self.executable, *self.options, *args]
+    def _execute(
+        self,
+        args: list[str],
+        *,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
+        command = [self.executable, *(options or self.options), *args]
+        deadline = time.monotonic() + self.timeout_seconds
         try:
-            return subprocess.run(
+            # 参数均为程序生成的固定列表，未使用 shell；提交哈希与主机构成已校验。
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            process = subprocess.Popen(
                 command,
                 env=self._environment(),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=text,
+                encoding="utf-8" if text else None,
+                errors="replace" if text else None,
                 shell=False,
             )
         except FileNotFoundError as exc:
             raise IntegrationError(
                 "git_unavailable", "服务器未安装 Git，无法获取代码快照。"
             ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise IntegrationError("repository_fetch_timeout", "获取代码快照超时。") from exc
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                process.kill()
+                process.communicate()
+                raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise IntegrationError("repository_fetch_timeout", "获取代码快照超时。")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
-    def _run(self, args: list[str], *, code: str) -> str:
-        completed = self._execute(args)
+    def _run(
+        self,
+        args: list[str],
+        *,
+        code: str,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
+        completed = self._execute(args, options=options, cancel_event=cancel_event)
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip().splitlines()
             if detail:
@@ -169,70 +263,105 @@ class SubprocessGitClient:
         digest = hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:24]
         return self.mirror_root / f"{digest}.git"
 
-    def _has_commit(self, mirror: Path, commit: str) -> bool:
-        completed = self._execute(["-C", str(mirror), "cat-file", "-e", f"{commit}^{{commit}}"])
+    def local_mirror(self, repo_url: str) -> Path | None:
+        mirror = self._mirror_path(repo_url)
+        if (mirror / "HEAD").is_file():
+            return mirror
+        return None
+
+    def has_commit(self, handle: Path, commit: str) -> bool:
+        completed = self._execute(["-C", str(handle), "cat-file", "-e", f"{commit}^{{commit}}"])
         return completed.returncode == 0
 
-    def _init_mirror(self, mirror: Path, repo_url: str) -> None:
-        mirror.parent.mkdir(parents=True, exist_ok=True)
-        self._run(["init", "--bare", "--quiet", str(mirror)], code="repository_fetch_failed")
-        self._run(
-            ["-C", str(mirror), "remote", "add", "origin", repo_url],
-            code="repository_fetch_failed",
-        )
+    def _ensure_remote(self, mirror: Path, repo_url: str) -> None:
+        """修复缺 HEAD 或缺少/错误 origin 的半成品镜像。"""
+        if not (mirror / "HEAD").is_file():
+            shutil.rmtree(mirror, ignore_errors=True)
+            mirror.parent.mkdir(parents=True, exist_ok=True)
+            self._run(["init", "--bare", "--quiet", str(mirror)], code="repository_fetch_failed")
+        current = self._execute(["-C", str(mirror), "config", "--get", "remote.origin.url"])
+        if current.returncode != 0:
+            self._run(
+                ["-C", str(mirror), "remote", "add", "origin", repo_url],
+                code="repository_fetch_failed",
+            )
+        elif current.stdout.strip() != repo_url:
+            self._run(
+                ["-C", str(mirror), "remote", "set-url", "origin", repo_url],
+                code="repository_fetch_failed",
+            )
 
-    def fetch(self, repo_url: str, commit: str) -> Path:
+    def fetch(
+        self,
+        repo_url: str,
+        commit: str,
+        *,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Path:
         mirror = self._mirror_path(repo_url)
+        options = options or self.options
         with self._lock_for(mirror):
-            if not (mirror / "HEAD").exists():
-                self._init_mirror(mirror, repo_url)
-            if not self._has_commit(mirror, commit):
-                self._fetch_commit(mirror, commit)
+            self._ensure_remote(mirror, repo_url)
+            if not self.has_commit(mirror, commit):
+                self._fetch_commit(mirror, commit, options=options, cancel_event=cancel_event)
+            self._enforce_mirror_quota(keep=mirror)
         return mirror
 
-    def _fetch_commit(self, mirror: Path, commit: str) -> None:
+    def _fetch_commit(
+        self,
+        mirror: Path,
+        commit: str,
+        *,
+        options: tuple[str, ...],
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        branches = "+refs/heads/*:refs/remotes/origin/*"
         attempts = (
             ["-C", str(mirror), "fetch", "--no-tags", "--depth=1", "origin", commit],
+            ["-C", str(mirror), "fetch", "--no-tags", "--depth=1", "origin", branches],
             [
                 "-C",
                 str(mirror),
                 "fetch",
                 "--no-tags",
-                "--depth=1",
+                f"--depth={self.max_fetch_depth}",
                 "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-            ],
-            [
-                "-C",
-                str(mirror),
-                "fetch",
-                "--no-tags",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
+                branches,
             ],
         )
         reachable = False
         for args in attempts:
             try:
-                self._run(args, code="repository_fetch_failed")
+                self._run(
+                    args, code="repository_fetch_failed", options=options, cancel_event=cancel_event
+                )
             except _GitFailure:
                 continue
             reachable = True
-            if self._has_commit(mirror, commit):
+            if self.has_commit(mirror, commit):
                 return
-        if self._has_commit(mirror, commit):
+        if self.has_commit(mirror, commit):
             return
         if reachable:
             # 托管端点可达但提交对象不存在（例如链接中的 sha 不存在）。
             raise IntegrationError("commit_not_found", "托管主机上找不到指定提交。")
         raise IntegrationError("repository_fetch_failed", "无法从代码托管主机获取指定提交。")
 
-    def ensure(self, handle: Path, commit: str) -> None:
-        if self._has_commit(handle, commit):
+    def ensure(
+        self,
+        handle: Path,
+        commit: str,
+        *,
+        options: tuple[str, ...] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        if self.has_commit(handle, commit):
             return
+        options = options or self.options
         with self._lock_for(handle):
-            if not self._has_commit(handle, commit):
-                self._fetch_commit(handle, commit)
+            if not self.has_commit(handle, commit):
+                self._fetch_commit(handle, commit, options=options, cancel_event=cancel_event)
 
     def resolve(self, handle: Path, commit: str) -> str:
         output = self._run(
@@ -267,58 +396,133 @@ class SubprocessGitClient:
                 parents.append(candidate)
         return parents
 
-    def export(self, handle: Path, commit: str, destination: Path) -> int:
+    def export(
+        self,
+        handle: Path,
+        commit: str,
+        destination: Path,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> int:
+        """按提交树直接读取 blob，不应用 `export-ignore`/`export-subst`。"""
+        entries = self._tree_entries(handle, commit, cancel_event=cancel_event)
+        if len(entries) > self.max_files:
+            raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
         destination.mkdir(parents=True, exist_ok=True)
-        descriptor, archive_name = tempfile.mkstemp(suffix=".tar", prefix="snapshot-")
-        os.close(descriptor)
-        archive = Path(archive_name)
-        try:
-            self._run(
-                [
-                    "-C",
-                    str(handle),
-                    "archive",
-                    "--format=tar",
-                    f"--output={archive}",
-                    commit,
-                ],
-                code="snapshot_export_failed",
-            )
-            return self._extract(archive, destination)
-        except OSError as exc:
-            logger.warning("snapshot export failed: %s", type(exc).__name__)
-            raise IntegrationError("snapshot_export_failed", "导出指定版本快照失败。") from exc
-        finally:
-            archive.unlink(missing_ok=True)
-
-    def _extract(self, archive: Path, destination: Path) -> int:
         root = destination.resolve()
+        process = subprocess.Popen(
+            [self.executable, *self.options, "-C", str(handle), "cat-file", "--batch"],
+            env=self._environment(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+        )
         count = 0
         total = 0
-        with tarfile.open(archive, mode="r:") as tar:
-            for member in tar:
-                # 只导出普通文件；符号链接、子模块等无法安全物化。
-                if not member.isfile():
-                    continue
-                parts = [part for part in member.name.replace("\\", "/").split("/") if part]
-                if not parts or any(part in {".", ".."} for part in parts):
-                    continue
-                if any(part.casefold() == ".git" for part in parts):
-                    continue
-                relative = "/".join(parts)
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            for sha, raw_path in entries:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
+                relative = _relative_path(raw_path)
+                process.stdin.write(sha.encode("ascii") + b"\n")
+                process.stdin.flush()
+                header = process.stdout.readline()
+                fields = header.split()
+                if len(fields) != 3 or fields[1] != b"blob":
+                    raise IntegrationError("snapshot_export_failed", "读取快照文件内容失败。")
+                size = int(fields[2])
+                if size > self.max_bytes or total + size > self.max_bytes:
+                    raise IntegrationError("snapshot_too_large", "指定版本快照体积超出上限。")
+                data = process.stdout.read(size)
+                process.stdout.read(1)  # 结尾换行
+                if len(data) != size:
+                    raise IntegrationError("snapshot_export_failed", "读取快照文件内容失败。")
                 target = (root / relative).resolve()
                 if not target.is_relative_to(root):
-                    continue
-                if member.size > self.max_bytes or total + member.size > self.max_bytes:
-                    raise IntegrationError("snapshot_too_large", "指定版本快照体积超出上限。")
-                count += 1
-                if count > self.max_files:
-                    raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
-                total += member.size
+                    raise IntegrationError("snapshot_export_failed", "快照路径超出目标目录。")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                source = tar.extractfile(member)
-                if source is None:
-                    continue
-                with source, open(target, "wb") as out:
-                    shutil.copyfileobj(source, out)
+                target.write_bytes(data)
+                count += 1
+                total += size
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            process.wait()
         return count
+
+    def _tree_entries(
+        self,
+        handle: Path,
+        commit: str,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> list[tuple[str, bytes]]:
+        completed = self._execute(
+            ["-C", str(handle), "ls-tree", "-r", "-z", "--full-tree", commit],
+            cancel_event=cancel_event,
+            text=False,
+        )
+        if completed.returncode != 0:
+            raise IntegrationError("snapshot_export_failed", "读取指定版本文件树失败。")
+        entries: list[tuple[str, bytes]] = []
+        for record in completed.stdout.split(b"\0"):
+            if not record:
+                continue
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split()
+            if len(fields) < 3 or not raw_path:
+                continue
+            mode, kind, sha = fields[0], fields[1], fields[2]
+            if kind != b"blob" or mode == b"120000":
+                # 符号链接与子模块无法安全物化为快照文件。
+                continue
+            entries.append((sha.decode("ascii"), raw_path))
+        entries.sort(key=lambda item: item[1])
+        return entries
+
+    def _enforce_mirror_quota(self, *, keep: Path) -> None:
+        if self.max_total_bytes is None or not self.mirror_root.is_dir():
+            return
+        mirrors = [path for path in self.mirror_root.iterdir() if path.is_dir()]
+        sizes = {path: _directory_size(path) for path in mirrors}
+        total = sum(sizes.values())
+        for path in sorted(mirrors, key=lambda item: item.stat().st_mtime):
+            if total <= self.max_total_bytes:
+                break
+            if path == keep:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            total -= sizes[path]
+        if total > self.max_total_bytes:
+            raise IntegrationError("storage_quota_exceeded", "快照镜像存储配额已用尽。")
+
+
+def _relative_path(raw: bytes) -> str:
+    """校验提交中的路径可唯一映射到跨平台快照路径。"""
+    try:
+        path = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise IntegrationError("snapshot_export_failed", "提交包含非 UTF-8 路径。") from exc
+    if "\\" in path:
+        raise IntegrationError("snapshot_export_failed", "提交包含跨平台歧义的路径。")
+    parts = path.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise IntegrationError("snapshot_export_failed", "提交包含非法路径。")
+    if any(part.casefold() == ".git" for part in parts):
+        raise IntegrationError("snapshot_export_failed", "提交包含 Git 元数据路径。")
+    return "/".join(parts)
+
+
+def _directory_size(path: Path) -> int:
+    total = 0
+    for file in path.rglob("*"):
+        try:
+            if file.is_file():
+                total += file.stat().st_size
+        except OSError:
+            continue
+    return total

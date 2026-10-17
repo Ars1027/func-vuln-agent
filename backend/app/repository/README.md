@@ -28,9 +28,14 @@
 （`private_network_target`）以及无法解析的主机（`network_unavailable`）。
 
 Git 命令固定带 `http.followRedirects=false`、`protocol.allow=never`、
-`protocol.https.allow=always`、禁用凭据助手与钩子，并清空继承的 `GIT_DIR` 等变量。
+`protocol.https.allow=always`、禁用凭据助手与钩子；子进程环境会清除 `GIT_DIR`、
+`GIT_CONFIG_*`（含 `GIT_CONFIG_COUNT/KEY_n/VALUE_n`）等可注入配置，避免 `url.insteadOf`
+把已校验的地址改写到其他主机。解析得到的公网地址会通过 `http.curloptResolve` 固定给
+Git，连接阶段不再重新解析主机名（需 Git ≥ 2.31，否则返回 `git_unsupported`）。
+浅拉取失败后的回退最多获取 `max_fetch_depth`（默认 200）层历史，不再保留完整分支历史。
 拉取失败、提交缺失与导出失败分别返回 `repository_fetch_failed`、`commit_not_found`、
-`snapshot_export_failed`；`git` 不在 PATH 时返回 `git_unavailable`。
+`snapshot_export_failed`；`git` 不在 PATH 时返回 `git_unavailable`；超时与取消分别返回
+`repository_fetch_timeout`、`repository_cancelled`，被取消时会终止 Git 子进程。
 
 ## 3. 存储与快照内容
 
@@ -43,17 +48,26 @@ storage/
 ```
 
 `snapshot_ref` 为 `snap-<16 位十六进制>`，由仓库地址与提交哈希派生，不携带标签或选版
-语义。只导出普通文件，跳过符号链接、子模块与 `.git` 条目；先写入 `tmp/` 再原子改名
-发布，元数据最后写入。单快照默认上限 200000 个文件 / 256 MiB。工具只接受登记过的
+语义。物化直接读取提交树 blob，不应用 `export-ignore` / `export-subst`；只导出普通文件，
+跳过符号链接、子模块与 `.git` 条目，拒绝含反斜杠、`..`、空段或非 UTF-8 的歧义路径。
+单快照默认上限 200000 个文件 / 256 MiB，镜像与快照各默认 2 GiB 总量配额；超限时按最旧
+优先回收缓存，仍超限返回 `storage_quota_exceeded`。元数据先写、文件树后原子改名，发布
+按 `snapshot_ref` 串行且幂等，重试会清理上次中断留下的孤儿目录；启动时清理 `tmp/`
+残留。文本读取只接受 UTF-8（无 NUL 字节），否则 `file_unreadable`。工具只接受登记过的
 `snapshot_ref`，格式错误或未登记一律 `snapshot_not_found`，不按路径猜测其他快照。
 
 ## 4. 证据工具
 
 | 工具 | 语义 | 覆盖范围 |
 | --- | --- | --- |
-| `search_code(query)` | 在快照的 C/C++ 源文件中做大小写敏感的字面量搜索，空白折叠后匹配，返回匹配所在完整行 | 文本级；不区分注释/字符串；默认最多 20 条并在 `scope` 中说明总数与截断 |
-| `read_file(path, start_line, end_line)` | 按 1 起始行号读取原文，`end_line` 超出文件时钳制并在 `scope` 说明 | 单次最多 400 行，超限 `range_too_large`；起始行越界 `line_out_of_range` |
-| `find_symbol(symbol)` | 按标识符边界定位定义、`#define` 宏、声明、调用与其他引用 | 依据括号/花括号文本形态分类，头文件中的 `name(...);` 视为声明；注释与字符串不剔除；默认最多 20 条 |
+| `search_code(query)` | 在快照的 C/C++ 源文件中做大小写敏感的字面量搜索，空白折叠后匹配，返回匹配所在完整行 | 文本级；不区分注释/字符串；默认最多 20 条，计数到 50000 条预算为止并在 `scope` 说明 |
+| `read_file(path, start_line, end_line)` | 按 1 起始行号流式读取原文，`end_line` 超出文件时钳制并在 `scope` 说明 | 单次最多 400 行，超限 `range_too_large`；起始行越界 `line_out_of_range` |
+| `find_symbol(symbol)` | 按标识符边界定位定义、`#define` 宏、声明、调用与其他引用 | 依据括号/花括号与作用域文本形态分类，头文件中的 `name(...);` 视为声明，命名空间/类作用域变量视为定义；注释与字符串不剔除；默认最多 20 条 |
+
+扫描会记录被排除的文件：超过单文件扫描上限的记入 `scope` 的 `skipped ... oversized`，
+非文本文件记入 `skipped ... non-text`；`locate_function` 找不到函数时也会在错误信息中
+说明这些缺口。`find_symbol` 的出现次数超过 `max_occurrences` 后只停止计数，仍继续扫描以
+保留后续定义，并在 `scope` 标注 `counts beyond N were not tallied`。
 
 `find_symbol` 返回顺序为定义/宏、声明、调用、其他引用，`scope` 列出前若干条的
 `路径:行号 分类` 与统计，便于 Agent 追踪辅助函数、调用方与全局变量。`locate_function`
@@ -70,7 +84,9 @@ storage/
 
 错误码：`invalid_path`、`path_escape`、`file_not_found`、`file_unreadable`、
 `line_out_of_range`、`range_too_large`、`invalid_line_range`、`invalid_symbol`、
-`empty_query`、`snapshot_not_found`、`snapshot_too_large`、`snapshot_write_failed`。
+`empty_query`、`snapshot_not_found`、`snapshot_too_large`、`snapshot_write_failed`、
+`storage_quota_exceeded`、`git_unsupported`、`repository_cancelled`、
+`repository_fetch_timeout`、`empty_snapshot`。
 
 ## 6. 验证记录
 
@@ -82,13 +98,14 @@ python -m ruff format --check .
 python -m pytest -q
 ```
 
-本机结果：`130 passed`，ruff 检查与格式检查通过。新增测试：
+本机结果：`150 passed`，ruff 检查与格式检查通过。新增测试：
 
 | 文件 | 覆盖 |
 | --- | --- |
-| `tests/test_repository_prepare.py` | `target=1/0` 与 `revision=commit/parent` 选版一致、`idx/func` 保留且结果不含选版信息、重复准备复用快照、快照间隔离、引用不可猜测、多父提交、根提交、仓库/提交缺失、函数不一致与重复、URL 白名单、私网与 DNS 失败 |
-| `tests/test_repository_tools.py` | 行号与原文一致、`end_line` 钳制、行区间上限、缺失文件、目录穿越、`.git` 路径、二进制文件、搜索命中/无命中/截断、边界检查与检查后数据变化、定义与声明与调用与注释引用分类、相似标识符不合并、宏与全局变量、跨文件调用路径、非法符号、未知快照引用 |
-| `tests/test_repository_git.py` | 真实 Git：拉取提交、解析父提交、按提交导出、快照不含 `.git`、镜像缓存复用、缺失仓库与提交、传输加固参数 |
+| `tests/test_repository_prepare.py` | `target=1/0` 与 `revision=commit/parent` 选版一致、`idx/func` 保留且结果不含选版信息、重复准备复用快照且不再解析 DNS、地址固定参数、快照间隔离、引用不可猜测、多父提交、根提交、仓库/提交缺失、函数不一致与重复、URL 白名单、私网与 DNS 失败 |
+| `tests/test_repository_tools.py` | 行号与原文一致、`end_line` 钳制、行区间上限、缺失文件、目录穿越、`.git` 路径、二进制与非 UTF-8 文件、隐藏目录扫描、搜索命中/无命中/截断/按大小排除、边界检查与检查后数据变化、定义与声明与调用与注释引用分类、相似标识符不合并、宏、命名空间全局变量、跨文件调用路径、出现次数截断仍保留定义、非法符号、未知快照引用 |
+| `tests/test_repository_store.py` | 发布幂等、孤儿目录修复、同一引用并发发布、临时目录清理、总配额按最旧回收、二进制与非 UTF-8 文本拒绝 |
+| `tests/test_repository_git.py` | 真实 Git：拉取提交、解析父提交、按提交导出、不应用 `export-ignore`、快照不含 `.git`、镜像缓存复用、缺失仓库与提交、子进程安全参数与配置注入清理、歧义路径拒绝 |
 
 `tests/test_repository_*.py` 的仓库内容均为人工编写的合成 C 片段，配合内存 `FakeGit`
 （`tests/fake_git.py`）或本地临时 Git 仓库，不调用网络与课程数据，不代表真实检测效果。
@@ -97,8 +114,11 @@ python -m pytest -q
 
 ## 7. 依赖与后续
 
-- 部署环境需提供 `git`（在 PATH 中）；未安装时准备与仓库工具返回 `git_unavailable`。
-  本机验证使用便携版 Git（仅放在被忽略的 `work/` 目录，不提交）。
+- 部署环境需提供 `git`（在 PATH 中，≥ 2.31 才能固定已验证地址）；未安装时准备与仓库
+  工具返回 `git_unavailable`。本机验证使用便携版 Git（仅放在被忽略的 `work/` 目录，不
+  提交）。
+- 缓存配额默认各 2 GiB，可通过 `RepositoryAdapters(max_storage_bytes=...)` 调整；多进程
+  共享同一存储目录时各自独立回收，需要部署侧保证只有一个准备服务写入。
 - 课程数据尚未到达，`commit_url` 的实际主机与路径形式、父提交规则需在数据到位后核对；
   如出现 `github.com` 以外的主机，通过 `FVA_REPOSITORY_HOSTS` 显式加入并补充验证。
 - 函数定位与符号查询是文本级启发式，不覆盖宏展开、条件编译与编译器 AST；复杂仓库的

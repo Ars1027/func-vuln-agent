@@ -74,6 +74,83 @@ def test_missing_repository_and_commit_are_reported(tmp_path):
     assert missing_commit.value.code == "commit_not_found"
 
 
+def test_export_does_not_apply_archive_attributes(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "synthetic@example.invalid")
+    _git(repo, "config", "user.name", "synthetic")
+    (repo / ".gitattributes").write_text("*.c export-ignore\n", encoding="utf-8")
+    (repo / "a.c").write_text("int value = 1;\n", encoding="utf-8")
+    commit = _commit(repo, "attributes")
+
+    client = SubprocessGitClient(tmp_path / "mirrors", allow_local_transport=True)
+    handle = client.fetch(str(repo), commit)
+    destination = tmp_path / "exported"
+    assert client.export(handle, commit, destination) == 2
+    assert (destination / "a.c").read_text(encoding="utf-8") == "int value = 1;\n"
+
+
+class _FakeProcess:
+    def __init__(self, command, **kwargs):
+        self.command = command
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+    def kill(self):
+        pass
+
+    def poll(self):
+        return 0
+
+    def wait(self):
+        return 0
+
+
+def test_git_subprocess_uses_security_options_and_scrubbed_env(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return _FakeProcess(command, **kwargs)
+
+    monkeypatch.setattr("app.repository.gitclient.subprocess.Popen", fake_popen)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url.https://evil.test.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com")
+
+    client = SubprocessGitClient(tmp_path / "mirrors")
+    client._execute(["version"])
+
+    command = captured["command"]
+    for option in (
+        "http.followRedirects=false",
+        "protocol.allow=never",
+        "protocol.https.allow=always",
+        "credential.helper=",
+    ):
+        assert option in command
+    env = captured["env"]
+    assert "GIT_CONFIG_COUNT" not in env
+    assert "GIT_CONFIG_KEY_0" not in env
+    assert "GIT_CONFIG_VALUE_0" not in env
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"a\\b.c", b"../a.c", b"a//b.c", b"/abs.c", b"a/.git/config", b"\xff.c"],
+)
+def test_export_rejects_ambiguous_paths(raw):
+    from app.repository.gitclient import _relative_path
+
+    with pytest.raises(IntegrationError):
+        _relative_path(raw)
+
+
 def test_transport_is_hardened_against_redirects_and_non_https(tmp_path):
     client = SubprocessGitClient(tmp_path / "mirrors")
     assert "http.followRedirects=false" in client.options

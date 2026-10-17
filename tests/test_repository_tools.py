@@ -58,13 +58,27 @@ HELPER_C = (
 )
 BUF_H = "#define MAX_BUF 64\nvoid copy_into(char *dst, size_t cap, const char *src, size_t len);\n"
 README = "# 说明\n\ncopy_into 只出现在文档中，不应作为代码证据。\n"
+ORDER_C = (
+    "int use_capacity(void) {\n"
+    "    capacity_check();\n"
+    "    capacity_check();\n"
+    "    return 0;\n"
+    "}\n"
+    "\n"
+    "int capacity_check(void) { return 1; }\n"
+)
+CXX = "namespace N {\nint capacity = 8;\n}\n"
 
 FILES = {
     "src/buf.c": BUF_C,
     "src/helper.c": HELPER_C,
     "src/buf.h": BUF_H,
+    "src/order.c": ORDER_C,
+    "src/cxx.cpp": CXX,
+    ".hidden/util.c": "int hidden_helper(void) { return 1; }\n",
     "README.md": README,
     "assets/blob.bin": b"\x00\x01binary",
+    "assets/latin1.c": b"int caf\xe9;\n",
 }
 
 
@@ -95,14 +109,14 @@ async def test_read_file_returns_source_lines_with_one_based_numbers(snapshot):
     assert location.content == (
         "    if (len > cap) {\n        return;\n    }\n    memcpy(dst, src, len);"
     )
-    assert "lines 7-10 of 19" in result.scope
+    assert "lines 7-10" in result.scope
 
 
 async def test_read_file_clamps_end_line_and_records_it(snapshot):
     adapters, ref = snapshot
     result = await adapters.read_file(ref, "src/buf.c", 18, 500)
     assert result.matches[0].end_line == 19
-    assert "clamped" in result.scope
+    assert "file ends at line 19" in result.scope
 
 
 @pytest.mark.parametrize(
@@ -226,6 +240,45 @@ async def test_find_symbol_rejects_invalid_names(snapshot):
     with pytest.raises(IntegrationError) as invalid:
         await adapters.find_symbol(ref, "copy-into")
     assert invalid.value.code == "invalid_symbol"
+
+
+async def test_hidden_directories_are_scanned(snapshot):
+    adapters, ref = snapshot
+    result = await adapters.find_symbol(ref, "hidden_helper")
+    assert (result.matches[0].path, result.matches[0].start_line) == (".hidden/util.c", 1)
+
+
+async def test_namespace_scope_variable_counts_as_definition(snapshot):
+    adapters, ref = snapshot
+    result = await adapters.find_symbol(ref, "capacity")
+    assert "src/cxx.cpp:2 definition" in result.scope
+
+
+async def test_definitions_survive_occurrence_cap(snapshot):
+    from app.repository.locate import find_symbol as locate_symbol
+
+    adapters, ref = snapshot
+    result = locate_symbol(adapters.store, ref, "capacity_check", max_occurrences=1)
+    assert (result.matches[0].path, result.matches[0].start_line) == ("src/order.c", 7)
+    assert "definition" in result.scope
+    assert "counts beyond 1 were not tallied" in result.scope
+
+
+async def test_invalid_utf8_file_is_rejected(snapshot):
+    adapters, ref = snapshot
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.read_file(ref, "assets/latin1.c", 1, 1)
+    assert failure.value.code == "file_unreadable"
+
+
+async def test_scan_reports_files_skipped_by_size(tmp_path):
+    adapters = build_adapters(tmp_path, max_file_bytes=40)
+    sample = await adapters.prepare_course(
+        CourseSample(idx=1, commit_url=COMMIT_URL, target=0, func=COPY_INTO)
+    )
+    result = await adapters.search_code(sample.snapshot_ref, "memcpy")
+    assert result.matches == []
+    assert "skipped" in result.scope and "oversized" in result.scope
 
 
 @pytest.mark.parametrize("tool", ["search_code", "find_symbol"])

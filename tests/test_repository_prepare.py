@@ -113,6 +113,24 @@ async def test_locate_function_returns_relative_path_and_source_lines(tmp_path):
     assert location.content == BUGGY_FUNC
 
 
+async def test_cached_snapshot_does_not_require_dns(tmp_path):
+    calls: list[str] = []
+
+    def resolver(host: str):
+        calls.append(host)
+        if len(calls) > 1:
+            raise OSError("dns unavailable")
+        return public_resolver(host)
+
+    adapters = build_adapters(tmp_path, resolver=resolver)
+    sample = CourseSample(idx=1, commit_url=COMMIT_URL, target=0, func=CHECKED_FUNC)
+    first = await adapters.prepare_course(sample)
+    second = await adapters.prepare_course(sample)
+
+    assert second.snapshot_ref == first.snapshot_ref
+    assert calls == ["github.com"]
+
+
 async def test_repeated_preparation_reuses_materialized_snapshot(tmp_path):
     fake = build_fake()
     adapters = build_adapters(tmp_path, fake)
@@ -121,6 +139,20 @@ async def test_repeated_preparation_reuses_materialized_snapshot(tmp_path):
             CourseSample(idx=1, commit_url=COMMIT_URL, target=0, func=CHECKED_FUNC)
         )
     assert len(fake.exported) == 1
+
+
+async def test_fetch_pins_verified_public_addresses(tmp_path):
+    fake = build_fake()
+    adapters = build_adapters(tmp_path, fake)
+    await adapters.prepare_course(
+        CourseSample(idx=1, commit_url=COMMIT_URL, target=0, func=CHECKED_FUNC)
+    )
+
+    assert fake.fetch_options
+    assert any(
+        "http.curloptResolve=github.com:443:140.82.112.3" in option
+        for option in fake.fetch_options[0]
+    )
 
 
 async def test_snapshots_are_isolated_from_each_other(tmp_path):

@@ -88,22 +88,16 @@ class RepositoryTools:
         ):
             raise IntegrationError("invalid_line_range", "读取区间必须是从 1 起始的递增行号。")
         relative, target = self.store.resolve_file(snapshot_ref, path)
-        text = self.store.read_text(target)
-        lines = text.splitlines()
-        if not lines:
-            raise IntegrationError("line_out_of_range", "该文件没有可读取的文本行。")
-        if start_line > len(lines):
-            raise IntegrationError("line_out_of_range", "起始行超出文件末尾。")
-        actual_end = min(end_line, len(lines))
-        if actual_end - start_line + 1 > self.max_read_lines:
-            raise IntegrationError(
-                "range_too_large",
-                f"单次读取最多 {self.max_read_lines} 行，请缩小区间。",
-            )
-        content = "\n".join(lines[start_line - 1 : actual_end])
-        scope = f"lines {start_line}-{actual_end} of {len(lines)} in {relative}"
-        if actual_end != end_line:
-            scope += f"; requested end_line {end_line} clamped to {len(lines)}"
+        lines, actual_end, reached_eof = self.store.read_lines(
+            target,
+            start_line,
+            end_line,
+            max_lines=self.max_read_lines,
+        )
+        content = "\n".join(lines)
+        scope = f"lines {start_line}-{actual_end} in {relative}"
+        if reached_eof:
+            scope += f"; file ends at line {actual_end}"
         return RepositoryResult(
             matches=[
                 CodeLocation(

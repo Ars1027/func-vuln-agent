@@ -1,9 +1,11 @@
 """课程 `commit_url` 的解析、托管主机白名单与网络目标校验。
 
 准备层只接受白名单内的固定托管端点，并且仅用于拼接仓库地址；
-实际拉取由 `GitClient` 用 https 完成，并关闭 HTTP 重定向。
+实际拉取由 `GitClient` 用 https 完成，并把解析到的公网地址固定给
+Git（`http.curloptResolve`），避免校验与连接之间的 DNS 重绑定。
 """
 
+import asyncio
 import ipaddress
 import re
 import socket
@@ -14,6 +16,7 @@ from urllib.parse import urlsplit
 from app.schemas.ports import IntegrationError
 
 DEFAULT_ALLOWED_HOSTS = ("github.com",)
+DEFAULT_DNS_TIMEOUT_SECONDS = 5.0
 
 # Git 托管端点的提交页：/{owner}/{repo}/commit/{sha}[.patch|.diff][/]
 _COMMIT_PATH = re.compile(
@@ -42,11 +45,7 @@ class CommitTarget:
 def parse_commit_url(
     url: str, allowed_hosts: Iterable[str] = DEFAULT_ALLOWED_HOSTS
 ) -> CommitTarget:
-    """校验提交链接并返回可拼接的 https 仓库地址。
-
-    拒绝非 https、带凭据/端口的主机、白名单外主机、IP 字面量
-    以及不符合约定格式的路径。
-    """
+    """校验提交链接并返回可拼接的 https 仓库地址。"""
     normalized_hosts = {host.strip().lower() for host in allowed_hosts if host.strip()}
     if not normalized_hosts:
         raise IntegrationError("repository_host_not_configured", "未配置允许的代码托管主机。")
@@ -102,13 +101,14 @@ def _system_resolver(host: str) -> list[tuple]:
     return socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
 
 
-def verify_public_host(host: str, resolver: Resolver | None = None) -> None:
-    """解析托管主机并拒绝解析到私网、回环、链路本地等非公网地址的目标。"""
+def resolve_public_addresses(host: str, resolver: Resolver | None = None) -> list[str]:
+    """解析托管主机并返回已验证的公网地址，拒绝非公网解析结果。"""
     resolve = resolver or _system_resolver
     try:
-        addresses = {str(info[4][0]).split("%", 1)[0] for info in resolve(host) if len(info) > 4}
+        raw = list(resolve(host))
     except OSError as exc:
         raise IntegrationError("network_unavailable", "无法解析代码托管主机。") from exc
+    addresses = sorted({str(info[4][0]).split("%", 1)[0] for info in raw if len(info) > 4})
     if not addresses:
         raise IntegrationError("network_unavailable", "无法解析代码托管主机。")
     for address in addresses:
@@ -121,3 +121,33 @@ def verify_public_host(host: str, resolver: Resolver | None = None) -> None:
             raise IntegrationError(
                 "private_network_target", "托管主机解析到非公网地址，已拒绝访问。"
             )
+    return addresses
+
+
+def verify_public_host(host: str, resolver: Resolver | None = None) -> list[str]:
+    """同步校验入口；返回可固定给 Git 的公网地址。"""
+    return resolve_public_addresses(host, resolver)
+
+
+async def verify_public_host_async(
+    host: str,
+    resolver: Resolver | None = None,
+    *,
+    timeout_seconds: float = DEFAULT_DNS_TIMEOUT_SECONDS,
+) -> list[str]:
+    """带超时的异步校验，避免 DNS 卡住时无限占用准备资源。"""
+    try:
+        if resolver is None:
+            loop = asyncio.get_running_loop()
+            raw = await asyncio.wait_for(
+                loop.getaddrinfo(host, 443, type=socket.SOCK_STREAM),
+                timeout=timeout_seconds,
+            )
+            return resolve_public_addresses(host, lambda _host: raw)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(resolve_public_addresses, host, resolver),
+            timeout=timeout_seconds,
+        )
+        return result
+    except TimeoutError as exc:
+        raise IntegrationError("network_unavailable", "解析代码托管主机超时。") from exc

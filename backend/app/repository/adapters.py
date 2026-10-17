@@ -31,9 +31,14 @@ class RepositoryAdapters:
         symbol_limit: int = 20,
         max_read_lines: int = 400,
         max_file_bytes: int = 2 * 1024 * 1024,
+        max_storage_bytes: int | None = 2 * 1024**3,
     ) -> None:
-        self.store = SnapshotStore(storage_dir)
-        self.git = git or SubprocessGitClient(self.store.root / "git")
+        self.store = SnapshotStore(storage_dir, max_total_bytes=max_storage_bytes)
+        # 进程启动时回收上次中断遗留的暂存目录。
+        self.store.cleanup_temp()
+        self.git = git or SubprocessGitClient(
+            self.store.root / "git", max_total_bytes=max_storage_bytes
+        )
         self.tools = RepositoryTools(
             self.store,
             search_limit=search_limit,
