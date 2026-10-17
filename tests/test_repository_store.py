@@ -255,3 +255,29 @@ def test_oversized_extensionless_files_are_skipped_before_preview(tmp_path, monk
     )
     monkeypatch.setattr(store_module, "_looks_like_source", lambda _path: pytest.fail("oversized"))
     assert list(store.iter_files(ref, max_bytes=4)) == []
+
+
+def test_scan_checks_cancellation_while_skipping_non_source_files(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    staged = stage(store, name="a.txt")
+    (staged / "b.txt").write_text("not source", encoding="utf-8")
+    store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+    cancel = threading.Event()
+    visited = set()
+    original_stat = Path.stat
+
+    def stop_after_first_file(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path.suffix == ".txt":
+            visited.add(path.name)
+            cancel.set()
+        return result
+
+    monkeypatch.setattr(Path, "stat", stop_after_first_file)
+    with pytest.raises(IntegrationError) as failure:
+        list(store.iter_files(ref, cancel_event=cancel))
+    assert failure.value.code == "repository_cancelled"
+    assert visited == {"a.txt"}

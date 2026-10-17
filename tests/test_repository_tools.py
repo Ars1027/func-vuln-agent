@@ -399,3 +399,156 @@ async def test_symbol_scopes_are_scanned_once_even_after_count_cap(tmp_path, mon
     assert len(openings) == 1
     assert "3+ occurrence(s)" in result.scope
     assert "definition" in result.scope
+
+
+async def test_search_returns_distinct_locations_but_counts_all_occurrences(tmp_path):
+    from app.repository.locate import search_code
+
+    func = "int entry(void) { return 1; }"
+    files = {"a.c": "/* needle needle needle */\nneedle();\n" + func, "b.c": "needle();\n"}
+    fake = FakeGit({REPO: {COMMIT: files}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    result = search_code(adapters.store, prepared.snapshot_ref, "needle", limit=3)
+    assert [(item.path, item.start_line, item.end_line) for item in result.matches] == [
+        ("a.c", 1, 1),
+        ("a.c", 2, 2),
+        ("b.c", 1, 1),
+    ]
+    assert "5 match(es)" in result.scope
+    assert "truncated by limit" not in result.scope
+
+    limited = search_code(adapters.store, prepared.snapshot_ref, "needle", limit=2)
+    assert [item.start_line for item in limited.matches] == [1, 2]
+    assert "truncated by limit 2" in limited.scope
+
+
+async def test_search_deduplication_preserves_multiline_ranges_and_match_budget(tmp_path):
+    from app.repository.locate import search_code
+
+    func = "int entry(void) { return 1; }"
+    text = "foo\nbar foo\nbar\nfoo\nbar\n" + func
+    fake = FakeGit({REPO: {COMMIT: {"a.c": text}}})
+    adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
+    prepared = await adapters.prepare_course(
+        CourseSample(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            target=0,
+        )
+    )
+    result = search_code(adapters.store, prepared.snapshot_ref, "foo bar", limit=3)
+    assert [(item.start_line, item.end_line) for item in result.matches] == [(1, 2), (2, 3), (4, 5)]
+    bounded = search_code(adapters.store, prepared.snapshot_ref, "foo bar", match_budget=1)
+    assert len(bounded.matches) == 1
+    assert "1+ match(es)" in bounded.scope
+    assert "match counting stopped at budget 1" in bounded.scope
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_cancelled_function_scan_exits_before_await_returns(snapshot, monkeypatch, timeout):
+    import asyncio
+    import threading
+
+    adapters, ref = snapshot
+    started, stopped, stop_test = threading.Event(), threading.Event(), threading.Event()
+    observed = []
+
+    def paused_files(*args, cancel_event=None, **kwargs):
+        observed.append(cancel_event)
+        started.set()
+        try:
+            while not stop_test.wait(0.005):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+            return
+            yield  # 保持迭代器形态，模拟正在等待下一份源码的扫描。
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(adapters.store, "iter_files", paused_files)
+
+    async def locate():
+        if timeout:
+            async with asyncio.timeout(0.1):
+                return await adapters.locate_function(ref, COPY_INTO)
+        return await adapters.locate_function(ref, COPY_INTO)
+
+    task = asyncio.create_task(locate())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if not timeout:
+            task.cancel()
+        with pytest.raises(TimeoutError if timeout else asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        assert observed[0] is not None and observed[0].is_set()
+        assert stopped.is_set()
+    finally:
+        stop_test.set()
+        assert await asyncio.to_thread(stopped.wait, 2)
+
+
+async def test_repeated_cancellation_waits_for_function_scan_cleanup(snapshot, monkeypatch):
+    import asyncio
+    import threading
+
+    adapters, ref = snapshot
+    started, cancelled, release, stopped = (threading.Event() for _ in range(4))
+
+    def paused_files(*args, cancel_event=None, **kwargs):
+        started.set()
+        try:
+            while not release.wait(0.005):
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled.set()
+            return
+            yield
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(adapters.store, "iter_files", paused_files)
+    task = asyncio.create_task(adapters.locate_function(ref, COPY_INTO))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        assert await asyncio.to_thread(cancelled.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        assert stopped.is_set()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(stopped.wait, 2)
+
+
+def test_function_text_normalization_checks_cancellation_during_work():
+    import threading
+
+    from app.repository.locate import normalize_whitespace
+
+    class CancelDuringWork(threading.Event):
+        def __init__(self):
+            super().__init__()
+            self.checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 3:
+                self.set()
+            return super().is_set()
+
+    cancel = CancelDuringWork()
+    with pytest.raises(IntegrationError) as failure:
+        normalize_whitespace("x" * 20_000, cancel_event=cancel)
+    assert failure.value.code == "repository_cancelled"

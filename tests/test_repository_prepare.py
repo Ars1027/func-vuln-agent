@@ -353,3 +353,104 @@ async def test_function_in_an_oversized_file_reports_a_scan_limit(tmp_path):
         )
     assert failure.value.code == "function_scan_limit"
     assert "无法确认" in failure.value.message and "不一致" not in failure.value.message
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "/* {func} */",
+        "// {func}\n",
+        "// archived implementation \\\n{func}\n",
+        "/\\\n/ {func}\n",
+        "/\\\r\n* {func} *\\\r\n/",
+        'const char *old = R"old({func})old";',
+    ],
+)
+async def test_function_text_in_comments_or_literals_is_not_current_code(tmp_path, template):
+    func = "int f(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": template.format(func=func).encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(
+                idx=1,
+                func=func,
+                commit_url=COMMIT_URL,
+                revision="commit",
+            )
+        )
+    assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        "/* {func} */",
+        "// archived implementation \\\n{func}",
+        "/\\\n/ {func}",
+        "/\\\n* {func} *\\\n/",
+    ],
+)
+async def test_commented_copy_does_not_make_real_function_ambiguous(tmp_path, comment):
+    func = "int f(void) { return 1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": f"{comment.format(func=func)}\n\n{func}\n"}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            revision="commit",
+        )
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == comment.count("\n") + 3
+    assert location.content == func
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        "/* function documentation */\nint f(void) { /* body note */ return 1; }",
+        '// function documentation\nint f(void) { use("/* literal */"); return 1; }',
+        "// function documentation \\\ncontinued\nint f(void) { return 1; }",
+        "/\\\n* function documentation *\\\n/\nint f(void) { return 1; }",
+    ],
+)
+async def test_function_comments_and_comment_like_literals_are_preserved(tmp_path, func):
+    fake = FakeGit({REPO: {COMMIT: {"a.c": func}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(
+            idx=1,
+            func=func,
+            commit_url=COMMIT_URL,
+            revision="commit",
+        )
+    )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.content == func
+
+
+@pytest.mark.parametrize(
+    "func",
+    [
+        "/* int f(void) { return 1; } */",
+        "// archived implementation \\\nint f(void) { return 1; }",
+        "/\\\n* int f(void) { return 1; } *\\\n/",
+    ],
+)
+async def test_comment_only_input_cannot_be_a_target_function(tmp_path, func):
+    fake = FakeGit({REPO: {COMMIT: {"a.c": func}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(
+                idx=1,
+                func=func,
+                commit_url=COMMIT_URL,
+                revision="commit",
+            )
+        )
+    assert failure.value.code == "function_not_found"

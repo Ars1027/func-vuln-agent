@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import threading
 
 from app.repository.locate import find_symbol, locate_function, search_code
 from app.repository.store import SnapshotStore
@@ -30,7 +31,22 @@ class RepositoryTools:
         self.max_file_bytes = max_file_bytes
 
     async def locate_function(self, snapshot_ref: str, func: str) -> CodeLocation:
-        return await asyncio.to_thread(self._locate_function, snapshot_ref, func)
+        cancel = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._locate_function, snapshot_ref, func, cancel)
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancel.set()
+            # 线程退出后再传播取消，调用方不会提前释放并发名额。
+            cleanup = asyncio.gather(worker, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            raise
 
     async def search_code(self, snapshot_ref: str, query: str) -> RepositoryResult:
         return await asyncio.to_thread(self._search_code, snapshot_ref, query)
@@ -47,9 +63,14 @@ class RepositoryTools:
     async def find_symbol(self, snapshot_ref: str, symbol: str) -> RepositoryResult:
         return await asyncio.to_thread(self._find_symbol, snapshot_ref, symbol)
 
-    def _locate_function(self, snapshot_ref: str, func: str) -> CodeLocation:
+    def _locate_function(
+        self,
+        snapshot_ref: str,
+        func: str,
+        cancel_event: threading.Event,
+    ) -> CodeLocation:
         self.store.snapshot_dir(snapshot_ref)
-        return locate_function(self.store, snapshot_ref, func)
+        return locate_function(self.store, snapshot_ref, func, cancel_event=cancel_event)
 
     def _search_code(self, snapshot_ref: str, query: str) -> RepositoryResult:
         self.store.snapshot_dir(snapshot_ref)

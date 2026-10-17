@@ -6,10 +6,12 @@
 """
 
 import re
+import threading
+from bisect import bisect_left
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from app.repository.store import ScanReport, SnapshotStore
+from app.repository.store import ScanReport, SnapshotStore, check_scan_cancelled
 from app.schemas.models import CodeLocation, RepositoryResult
 from app.schemas.ports import IntegrationError
 
@@ -42,24 +44,32 @@ _TRAILING_QUALIFIERS = re.compile(
 _TYPE_PREFIX_ENDINGS = frozenset("=(),;{}!|<>?:~^+-/%")
 _SCOPE_OPENERS = re.compile(r"\b(?:namespace|class|struct|union|enum)\b")
 _RANK = {"definition": 0, "macro": 0, "declaration": 1, "call": 2, "reference": 3}
+_LINE_SPLICE = r"\\\r?\n"
 _LEXEMES = re.compile(
-    r"""//[^\n]*|/\*[\s\S]*?(?:\*/|$)|"""
+    # C/C++ 先拼接反斜线换行；直接匹配原文，以保留物理行号和偏移。
+    rf"(?P<comment>/(?:{_LINE_SPLICE})*(?:/(?:{_LINE_SPLICE}|[^\n])*|"
+    rf"\*[\s\S]*?(?:\*(?:{_LINE_SPLICE})*/|$)))|"
     r"""(?:u8|u|U|L)?R"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"|"""
     r""""(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'"""
 )
 CLASSIFY_LOOKAHEAD = 400
 
 
-def normalize_whitespace(text: str) -> tuple[str, list[int]]:
+def normalize_whitespace(
+    text: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, list[int]]:
     """只折叠字面量外的空白，保留字符、字符串和原始字符串的内容及偏移。"""
+    check_scan_cancelled(cancel_event)
     characters: list[str] = []
     offsets: list[int] = []
     previous_space = False
-    literals = (
-        match for match in _LEXEMES.finditer(text) if not match.group().startswith(("//", "/*"))
-    )
+    literals = (match for match in _LEXEMES.finditer(text) if match.group("comment") is None)
     literal = next(literals, None)
     for offset, character in enumerate(text):
+        if cancel_event is not None and offset % 4096 == 0:
+            check_scan_cancelled(cancel_event)
         while literal is not None and offset >= literal.end():
             literal = next(literals, None)
         in_literal = literal is not None and literal.start() <= offset < literal.end()
@@ -79,6 +89,7 @@ def normalize_whitespace(text: str) -> tuple[str, list[int]]:
     end = len(characters)
     while end > start and characters[end - 1] == " ":
         end -= 1
+    check_scan_cancelled(cancel_event)
     return "".join(characters[start:end]), offsets[start:end]
 
 
@@ -94,15 +105,44 @@ def _expand_lines(text: str, start: int, end: int) -> tuple[int, int, str]:
     return start_line, end_line, "\n".join(lines[start_line - 1 : end_line])
 
 
-def iter_matches(text: str, needle: str) -> Iterator[tuple[int, int]]:
+def iter_matches(
+    text: str,
+    needle: str,
+    *,
+    code_offset: int | None = None,
+    cancel_event: threading.Event | None = None,
+) -> Iterator[tuple[int, int]]:
     """按原文偏移逐个产出匹配，避免为高频词一次性分配全部结果。"""
-    haystack, offsets = normalize_whitespace(text)
+    haystack, offsets = normalize_whitespace(text, cancel_event=cancel_event)
+    non_code = _LEXEMES.finditer(text) if code_offset is not None else iter(())
+    region = next(non_code, None)
     position = haystack.find(needle)
     while position != -1:
+        check_scan_cancelled(cancel_event)
         start = offsets[position]
         end = offsets[position + len(needle) - 1] + 1
-        yield start, end
+        in_non_code = False
+        if code_offset is not None:
+            code_start = offsets[position + code_offset]
+            while region is not None and region.end() <= code_start:
+                region = next(non_code, None)
+            in_non_code = region is not None and region.start() <= code_start < region.end()
+        if not in_non_code:
+            yield start, end
         position = haystack.find(needle, position + len(needle))
+
+
+def _first_code_offset(text: str) -> int | None:
+    offset = 0
+    while offset < len(text):
+        if text[offset].isspace():
+            offset += 1
+            continue
+        lexeme = _LEXEMES.match(text, offset)
+        if lexeme is None or lexeme.group("comment") is None:
+            return offset
+        offset = lexeme.end()
+    return None
 
 
 def locate_function(
@@ -111,15 +151,23 @@ def locate_function(
     func: str,
     *,
     report: ScanReport | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> CodeLocation:
     """在快照中定位待测函数的相对路径与原始行号。"""
-    needle, _ = normalize_whitespace(func)
-    if not needle:
-        raise IntegrationError("function_not_found", "待测函数内容为空，无法在快照中定位。")
+    needle, offsets = normalize_whitespace(func, cancel_event=cancel_event)
+    first_code = _first_code_offset(func)
+    if not needle or first_code is None:
+        raise IntegrationError("function_not_found", "待测函数不包含代码，无法在快照中定位。")
+    code_offset = bisect_left(offsets, first_code)
     scan = report if report is not None else ScanReport()
     found: list[CodeLocation] = []
-    for entry in store.iter_files(snapshot_ref, max_bytes=MAX_SCAN_BYTES, report=scan):
-        for start, end in iter_matches(entry.text, needle):
+    for entry in store.iter_files(
+        snapshot_ref, max_bytes=MAX_SCAN_BYTES, report=scan, cancel_event=cancel_event
+    ):
+        check_scan_cancelled(cancel_event)
+        for start, end in iter_matches(
+            entry.text, needle, code_offset=code_offset, cancel_event=cancel_event
+        ):
             start_line, end_line, content = _expand_lines(entry.text, start, end)
             found.append(
                 CodeLocation(
@@ -136,6 +184,7 @@ def locate_function(
                     "function_ambiguous",
                     f"待测函数在快照中出现多次（{locations}），无法确定唯一证据位置。",
                 )
+    check_scan_cancelled(cancel_event)
     if not found:
         detail = scan.note()
         if detail:
@@ -164,16 +213,27 @@ def search_code(
         raise IntegrationError("empty_query", "搜索内容不能为空。")
     report = ScanReport()
     matches: list[CodeLocation] = []
+    seen: set[tuple[str, int, int]] = set()
     total = 0
     truncated = False
+    locations_truncated = False
     for entry in store.iter_files(snapshot_ref, max_bytes=max_file_bytes, report=report):
+        line, cursor = 1, 0
         for start, end in iter_matches(entry.text, needle):
             if total >= match_budget:
                 truncated = True
                 break
             total += 1
-            if len(matches) >= limit:
+            line += entry.text.count("\n", cursor, start)
+            cursor = start
+            last_line = line + entry.text.count("\n", start, max(end - 1, start))
+            key = (entry.path, line, last_line)
+            if key in seen:
                 continue
+            if len(matches) >= limit:
+                locations_truncated = True
+                continue
+            seen.add(key)
             start_line, end_line, content = _expand_lines(entry.text, start, end)
             matches.append(
                 CodeLocation(
@@ -189,11 +249,11 @@ def search_code(
     scope = (
         f"case-sensitive literal text search (whitespace-normalized) over "
         f"{report.scanned} C/C++ files; {total}{'+' if truncated else ''} match(es), "
-        f"returning {len(matches)}"
+        f"returning {len(matches)} distinct location(s)"
     )
     if truncated:
         scope += f"; match counting stopped at budget {match_budget}"
-    elif total > len(matches):
+    elif locations_truncated:
         scope += f" (truncated by limit {limit})"
     skipped = report.note()
     if skipped:

@@ -51,6 +51,11 @@ CODE_SUFFIXES = frozenset(
 _SOURCE_DIRECTIVE = re.compile(r"^\s*#\s*(?:include|define|pragma|ifndef|if)\b", re.M)
 
 
+def check_scan_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise IntegrationError("repository_cancelled", "代码快照扫描已取消。")
+
+
 @dataclass(frozen=True)
 class FileEntry:
     path: str
@@ -268,16 +273,20 @@ class SnapshotStore:
         suffixes: frozenset[str] = CODE_SUFFIXES,
         max_bytes: int = 2 * 1024 * 1024,
         report: ScanReport | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[FileEntry]:
         """遍历快照内的文本源码；跳过 `.git`，并把超限/非文本文件记入报告。"""
+        check_scan_cancelled(cancel_event)
         root = self.snapshot_dir(snapshot_ref).resolve()
         for directory, subdirectories, filenames in os.walk(root):
+            check_scan_cancelled(cancel_event)
             subdirectories[:] = sorted(
                 name
                 for name in subdirectories
                 if name.casefold() != ".git" and not (Path(directory) / name).is_symlink()
             )
             for filename in sorted(filenames):
+                check_scan_cancelled(cancel_event)
                 if filename.casefold() == ".git":
                     continue
                 path = Path(directory) / filename
@@ -305,6 +314,7 @@ class SnapshotStore:
                     continue
                 if report is not None:
                     report.scanned += 1
+                check_scan_cancelled(cancel_event)
                 yield FileEntry(path=relative, text=text, size=stat.st_size)
 
     def source_files(
