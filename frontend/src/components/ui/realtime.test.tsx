@@ -152,6 +152,16 @@ describe("useElapsed", () => {
     expect(formatDuration(1500)).toBe("1.5 秒");
     expect(formatDuration(65000)).toBe("1 分 5 秒");
   });
+
+  it.each([
+    [119499, "1 分 59 秒"],
+    [119500, "2 分 0 秒"],
+    [119999, "2 分 0 秒"],
+    [120000, "2 分 0 秒"],
+    [179500, "3 分 0 秒"],
+  ])("耗时 %i 毫秒在舍入后正确进位", (ms, expected) => {
+    expect(formatDuration(ms)).toBe(expected);
+  });
 });
 
 describe("useChangeFlash", () => {

@@ -1,4 +1,4 @@
-import { apiUrl } from "./client";
+import { apiUrl, findUnrepresentableIdx } from "./client";
 import { EVENT_TYPES, type EventEnvelope } from "./types";
 
 export type SseState = "connecting" | "open" | "closed" | "error";
@@ -24,7 +24,8 @@ function parseEvent(raw: string): EventEnvelope | null {
       value === null ||
       typeof value.task_id !== "string" ||
       typeof value.seq !== "number" ||
-      typeof value.type !== "string"
+      typeof value.type !== "string" ||
+      findUnrepresentableIdx(value) !== null
     ) {
       return null;
     }

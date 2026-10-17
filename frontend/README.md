@@ -18,7 +18,8 @@ npm run dev            # http://127.0.0.1:5173
 ```
 
 开发服务器把 `/api` 代理到 `http://127.0.0.1:8000`，浏览器只发出同源请求，因此**后端不需要开放 CORS**。
-后端地址可用 `VITE_PROXY_TARGET` 覆盖；变量说明见 [`.env.example`](.env.example)。
+后端地址可用 `VITE_PROXY_TARGET` 覆盖：复制 `.env.example` 为 `.env` 后修改该值并重启开发服务器。
+配置按 Vite 当前模式读取 `.env` / `.env.[mode]`，Shell 环境变量优先；变量说明见 [`.env.example`](.env.example)。
 
 正式构建与本模块自检：
 
@@ -50,11 +51,14 @@ npm run build          # 产物在 frontend/dist/
   整数 `1` 与字符串 `"1"` 使用不同的键（`src/state/idx.ts`），不会互相覆盖。
 - **失败保留**：`error` 事件把对应样本移入失败状态，但保留已到达的分析；执行失败不会被补成 `prediction=0`。
   快照里只有 `failures`、没有对应样本状态的失败项（服务重启中断排队输入）也会补成失败态，不漏项、不少计。
-- **标识无损**：整数 `idx` 超出 JavaScript 安全整数范围（±2^53-1）时接口层直接报
-  `idx_not_representable`，不接受已被 `JSON.parse` 舍入、可能合并不同样本的标识；需要大整数请改用字符串。
+- **标识无损**：整数 `idx` 超出 JavaScript 安全整数范围（±2^53-1）时，HTTP 响应报
+  `idx_not_representable`，SSE 事件跳过并显示提示（包括事件内嵌报告的 `idx`）；
+  不接受已被 `JSON.parse` 舍入、可能合并不同样本的标识，需要大整数请改用字符串。
 - **已受理不丢**：任务提交成功后立即记下 `task_id`，随后读取快照或状态失败时仍保留该任务并可重试。
-- 事件流收到 `task_completed` 后主动关闭，避免服务端结束流后被浏览器反复重连；快照之后确认任务已终止时
-  根本不再订阅——后端对终止任务会立即结束流，此时不会有 `task_completed` 送达。
+- 事件流收到 `task_completed` 后主动关闭，避免服务端结束流后被浏览器反复重连；快照之后确认任务已终止时，
+  再读一次最终报告快照后关闭连接，补齐两次读取之间产生的报告与失败项，不再订阅空事件流。
+- **下载只采用最新请求**：重试下载、切换任务或离开页面后，旧请求的成功与失败响应均失效；
+  新任务同时清除上一任务的下载错误。
 
 ## 目录
 
@@ -105,15 +109,15 @@ frontend/
 
 ```sh
 npm run typecheck   # tsc --noEmit
-npm run test        # 9 个测试文件 / 53 个用例
+npm run test        # 9 个测试文件 / 69 个用例
 npm run build       # dist/ 构建产物
 ```
 
 测试覆盖样本标识类型隔离、样本内 `id` 合并、重复事件与迟到旧快照、失败保留、按假设分组等归约器行为，
 并用录制自 `app.demo` 的真实事件流做契约回归；`src/app.test.tsx` 在 jsdom 中走通单条与批量界面流程；
-`src/components/ui/realtime.test.tsx` 覆盖进度条分段、条件计数、计时冻结与变化提示；
-`src/hooks/useTaskStream.test.tsx` 覆盖已受理任务在读取失败后仍可重试、终止任务不再订阅、并发提交不互相覆盖；
-`src/api/client.test.ts` 覆盖超范围整数 `idx` 的拒绝。
+`src/components/ui/realtime.test.tsx` 覆盖进度条分段、条件计数、计时冻结、秒数进位与变化提示；
+`src/hooks/useTaskStream.test.tsx` 覆盖已受理任务在读取失败后仍可重试、终态补读、并发提交与下载乱序响应；
+`src/api/client.test.ts` 与 `src/api/sse.test.ts` 覆盖 HTTP/SSE 超范围整数 `idx` 的拒绝。
 连到演示后端的实测命令与结果见[联调记录](INTEGRATION.md)。
 
 ## 剩余依赖

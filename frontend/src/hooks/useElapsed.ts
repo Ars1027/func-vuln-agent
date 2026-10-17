@@ -40,7 +40,8 @@ export function formatDuration(ms: number): string {
   if (seconds < 60) {
     return `${seconds.toFixed(1)} 秒`;
   }
-  const minutes = Math.floor(seconds / 60);
-  const rest = Math.round(seconds - minutes * 60);
+  const roundedSeconds = Math.round(seconds);
+  const minutes = Math.floor(roundedSeconds / 60);
+  const rest = roundedSeconds % 60;
   return `${minutes} 分 ${rest} 秒`;
 }

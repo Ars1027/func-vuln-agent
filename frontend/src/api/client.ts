@@ -55,7 +55,7 @@ async function readError(response: Response): Promise<ApiError> {
  * 会把 9007199254740993 这类字面量四舍五入，两个不同样本就会得到同一个数字并被界面合并，
  * 报告与事件串到错误的样本上。这里宁可报错，也不接受已经失真的标识。
  */
-function findUnrepresentableIdx(value: unknown, path = "response"): string | null {
+export function findUnrepresentableIdx(value: unknown, path = "response"): string | null {
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
       const found = findUnrepresentableIdx(value[index], `${path}[${index}]`);
