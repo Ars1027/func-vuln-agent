@@ -550,7 +550,9 @@ class SubprocessGitClient:
                 code="commit_not_found",
             )
         parents = []
-        for line in output.splitlines():
+        for line in output.split("\n"):
+            if not line:
+                break
             if line.startswith("parent "):
                 candidate = line.split(" ", 1)[1].strip()
                 if len(candidate) != 40 or any(ch not in "0123456789abcdef" for ch in candidate):

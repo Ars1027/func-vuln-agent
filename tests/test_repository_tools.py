@@ -679,3 +679,18 @@ def test_symbol_context_checks_cancellation_during_long_scan(prefix):
     with pytest.raises(IntegrationError) as failure:
         list(_symbol_contexts(text, re.finditer("needle", text), cancel_event=CancelDuringScan()))
     assert failure.value.code == "repository_cancelled"
+
+
+@pytest.mark.parametrize("tool", ["locate_function", "search_code", "find_symbol"])
+async def test_source_io_failure_propagates_through_repository_tools(snapshot, monkeypatch, tool):
+    from pathlib import Path
+
+    adapters, ref = snapshot
+
+    def fail_read(path):
+        raise PermissionError("synthetic source I/O failure")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+    with pytest.raises(IntegrationError) as failure:
+        await getattr(adapters, tool)(ref, *_TOOL_ARGUMENTS[tool])
+    assert failure.value.code == "file_unreadable"

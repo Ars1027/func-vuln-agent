@@ -478,3 +478,29 @@ def test_tree_pipe_read_errors_are_export_failures(tmp_path, monkeypatch, error)
         client.export(tmp_path / "mirror.git", "1" * 40, tmp_path / "exported")
     assert failure.value.code == "snapshot_export_failed"
     assert writer.closed and reader.closed
+
+
+@pytest.mark.parametrize("message", ["parent directory fix", "parent " + "f" * 40])
+def test_parent_lines_in_commit_messages_do_not_affect_parent_selection(tmp_path, message):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "synthetic@example.invalid")
+    _git(repo, "config", "user.name", "synthetic")
+    (repo / "a.c").write_text("int value = 1;\n", encoding="utf-8")
+    first = _commit(repo, message)
+    (repo / "a.c").write_text("int value = 2;\n", encoding="utf-8")
+    second = _commit(repo, message)
+    client = SubprocessGitClient(tmp_path / "mirrors")
+    assert client.parents(repo, first) == []
+    assert client.parents(repo, second) == [first]
+
+
+def test_invalid_parent_in_commit_header_still_fails(tmp_path, monkeypatch):
+    client = SubprocessGitClient(tmp_path / "mirrors")
+    monkeypatch.setattr(
+        client, "_run", lambda *args, **kwargs: "tree " + "1" * 40 + "\nparent invalid\n\nmessage"
+    )
+    with pytest.raises(IntegrationError) as failure:
+        client.parents(tmp_path / "repo", "2" * 40)
+    assert failure.value.code == "commit_not_found"

@@ -18,6 +18,8 @@
 （`function_not_found` / `function_ambiguous`）；源码因大小上限未扫描且没有找到函数时返回
 `function_scan_limit`，不会把扫描不完整当作函数不存在。字符串、字符与 C++ 原始字符串
 内部的空白必须一致，只在字面量外折叠排版空白。
+函数比较还保留决定行注释范围的终止换行，首个代码标记须位于标识符边界；
+普通文本搜索继续折叠排版空白并允许子串匹配。
 定位时核对函数首个代码 token 的源码位置，排除落在注释或字符串中的候选；合法的前导注释
 和函数内部注释仍保留。函数定位、搜索、符号查询、文件读取和本地/网络快照物化共用
 协作取消：通知工作线程并等待其退出后，才向调用方传播取消并释放并发名额。
@@ -40,6 +42,7 @@ Git，连接阶段不再重新解析主机名（需 Git ≥ 2.31，否则返回 
 浅拉取失败后的回退最多获取 `max_fetch_depth`（默认 200）层历史，不再保留完整分支历史。
 缩写 SHA 超出浅历史查找范围时返回 `commit_lookup_limited`，要求提供完整 40 位 SHA；
 这不等于提交不存在。完整 SHA 的已发布快照在镜像被回收后仍可直接离线复用。
+父提交只从提交对象头部解析，到首个空行结束；提交消息中的 `parent` 文本不参与选版。
 拉取失败、提交缺失与导出失败分别返回 `repository_fetch_failed`、`commit_not_found`、
 `snapshot_export_failed`；`git` 不在 PATH 时返回 `git_unavailable`；超时与取消分别返回
 `repository_fetch_timeout`、`repository_cancelled`，被取消时会终止 Git 及其子进程；
@@ -92,8 +95,10 @@ storage/
 扫描覆盖 C/C++ 常见后缀（含 `.cc/.cpp/.cxx/.hpp/.tcc/.tpp/.ii/.cu/.cuh/.ixx/.cppm` 等）
 以及含预处理指令的无扩展名头文件；被判为其他类型的文件会计入 `scope` 的
 `skipped ... other extensions`，超过单文件扫描上限的记入 `oversized`，非文本文件记入
-`non-text`；`locate_function` 找不到函数时也会在错误信息中说明这些缺口。符号扫描预算按
-文件字节数计算，避免多字节文本绕过 64 MiB 上限。`find_symbol` 的出现次数超过
+`non-text`；`locate_function` 找不到函数时也会在错误信息中说明这些缺口。
+已确认的 NUL/非 UTF-8 内容可以按非文本排除；实际文件读取、属性查询、目录遍历或
+无扩展名预览的 I/O 故障会抛出 `file_unreadable`，不会伪装成无匹配或非文本内容。
+符号扫描预算按文件字节数计算，避免多字节文本绕过 64 MiB 上限。`find_symbol` 的出现次数超过
 `max_occurrences` 后只停止计数，仍继续扫描以保留后续定义；作用域状态只向前扫描一次，
 单次分类前瞻和变量声明前缀各最多查看 400 个字符，在 `scope` 标明覆盖范围及
 `counts beyond N were not tallied`。定义/宏、声明、调用、其他引用分别保留有限候选，

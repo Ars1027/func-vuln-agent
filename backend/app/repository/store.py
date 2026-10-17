@@ -16,6 +16,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from stat import S_ISREG
+from typing import NoReturn
 
 from app.schemas.paths import normalize_snapshot_path
 from app.schemas.ports import IntegrationError
@@ -50,6 +51,17 @@ CODE_SUFFIXES = frozenset(
 )
 # 无扩展名的 C/C++ 头文件（如 `include/foo`）按预处理指令识别。
 _SOURCE_DIRECTIVE = re.compile(r"^\s*#\s*(?:include|define|pragma|ifndef|if)\b", re.M)
+
+
+class _NonTextFile(IntegrationError):
+    """已确认的非文本内容，可从源码扫描中主动排除；读取故障不属于此类。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("file_unreadable", message)
+
+
+def _raise_read_error(error: OSError) -> NoReturn:
+    raise IntegrationError("file_unreadable", "无法读取该文件。") from error
 
 
 def check_scan_cancelled(cancel_event: threading.Event | None) -> None:
@@ -228,7 +240,7 @@ class SnapshotStore:
         try:
             return raw.decode("utf-8").replace("\r\n", "\n")
         except UnicodeDecodeError as exc:
-            raise IntegrationError("file_unreadable", "该文件不是 UTF-8 文本。") from exc
+            raise _NonTextFile("该文件不是 UTF-8 文本。") from exc
 
     def _read_bytes(self, path: Path) -> bytes:
         try:
@@ -236,7 +248,7 @@ class SnapshotStore:
         except OSError as exc:
             raise IntegrationError("file_unreadable", "无法读取该文件。") from exc
         if b"\x00" in raw:
-            raise IntegrationError("file_unreadable", "该文件不是文本文件。")
+            raise _NonTextFile("该文件不是文本文件。")
         return raw
 
     def read_lines(
@@ -262,7 +274,7 @@ class SnapshotStore:
                 while chunk := raw.read(8192):
                     check_scan_cancelled(cancel_event)
                     if b"\x00" in chunk:
-                        raise IntegrationError("file_unreadable", "该文件不是文本文件。")
+                        raise _NonTextFile("该文件不是文本文件。")
             except OSError as exc:
                 raise IntegrationError("file_unreadable", "无法读取该文件。") from exc
             raw.seek(0)
@@ -281,7 +293,7 @@ class SnapshotStore:
                         break
                     lines.append(line.removesuffix("\r\n").removesuffix("\n"))
             except UnicodeDecodeError as exc:
-                raise IntegrationError("file_unreadable", "该文件不是 UTF-8 文本。") from exc
+                raise _NonTextFile("该文件不是 UTF-8 文本。") from exc
         check_scan_cancelled(cancel_event)
         if not lines:
             raise IntegrationError("line_out_of_range", "起始行超出文件末尾。")
@@ -301,7 +313,7 @@ class SnapshotStore:
         """遍历快照内的文本源码；跳过 `.git`，并把超限/非文本文件记入报告。"""
         check_scan_cancelled(cancel_event)
         root = self.snapshot_dir(snapshot_ref).resolve()
-        for directory, subdirectories, filenames in os.walk(root):
+        for directory, subdirectories, filenames in os.walk(root, onerror=_raise_read_error):
             check_scan_cancelled(cancel_event)
             subdirectories[:] = sorted(
                 name
@@ -315,10 +327,10 @@ class SnapshotStore:
                 path = Path(directory) / filename
                 relative = path.relative_to(root).as_posix()
                 try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                if not path.is_file() or path.is_symlink():
+                    stat = path.lstat()
+                except OSError as exc:
+                    _raise_read_error(exc)
+                if not S_ISREG(stat.st_mode):
                     continue
                 if stat.st_size > max_bytes:
                     if report is not None:
@@ -331,7 +343,7 @@ class SnapshotStore:
                     continue
                 try:
                     text = self.read_text(path)
-                except IntegrationError:
+                except _NonTextFile:
                     if report is not None:
                         report.binary.append(relative)
                     continue
@@ -351,8 +363,8 @@ def _looks_like_source(path: Path, preview_bytes: int = 4096) -> bool:
     try:
         with path.open("rb") as stream:
             head = stream.read(preview_bytes)
-    except OSError:
-        return False
+    except OSError as exc:
+        _raise_read_error(exc)
     if b"\x00" in head:
         return False
     try:

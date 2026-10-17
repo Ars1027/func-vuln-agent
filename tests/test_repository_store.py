@@ -4,7 +4,7 @@ import os
 import threading
 
 import pytest
-from app.repository.store import SnapshotStore
+from app.repository.store import ScanReport, SnapshotStore
 from app.schemas.ports import IntegrationError
 
 REPO = "https://github.com/acme/buf.git"
@@ -267,7 +267,7 @@ def test_scan_checks_cancellation_while_skipping_non_source_files(tmp_path, monk
     store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
     cancel = threading.Event()
     visited = set()
-    original_stat = Path.stat
+    original_stat = Path.lstat
 
     def stop_after_first_file(path, *args, **kwargs):
         result = original_stat(path, *args, **kwargs)
@@ -276,7 +276,7 @@ def test_scan_checks_cancellation_while_skipping_non_source_files(tmp_path, monk
             cancel.set()
         return result
 
-    monkeypatch.setattr(Path, "stat", stop_after_first_file)
+    monkeypatch.setattr(Path, "lstat", stop_after_first_file)
     with pytest.raises(IntegrationError) as failure:
         list(store.iter_files(ref, cancel_event=cancel))
     assert failure.value.code == "repository_cancelled"
@@ -413,3 +413,55 @@ def test_cancelled_quota_scan_cannot_publish_a_snapshot(tmp_path, monkeypatch):
     assert failure.value.code == "repository_cancelled"
     assert not store.exists(ref)
     assert not (store.refs / f"{ref}.json").exists()
+
+
+@pytest.mark.parametrize("failed_step", ["read", "stat", "preview", "walk"])
+def test_scan_io_errors_are_execution_failures(tmp_path, monkeypatch, failed_step):
+    from pathlib import Path
+
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    store.publish(stage(store, "header", "#define VALUE 1\n"), ref, repo_url=REPO, commit="1" * 40)
+    root = store.snapshot_dir(ref)
+    source = root / "header"
+
+    def fail_path_operation(original):
+        def operation(path, *args, **kwargs):
+            if path == source:
+                raise PermissionError("synthetic unreadable source")
+            return original(path, *args, **kwargs)
+
+        return operation
+
+    if failed_step == "stat":
+        for name in ("stat", "lstat"):
+            monkeypatch.setattr(Path, name, fail_path_operation(getattr(Path, name)))
+    elif failed_step == "walk":
+        original_scandir = os.scandir
+
+        def scandir(path):
+            if Path(path) == root:
+                raise PermissionError("synthetic unreadable directory")
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir)
+    else:
+        name = "read_bytes" if failed_step == "read" else "open"
+        monkeypatch.setattr(Path, name, fail_path_operation(getattr(Path, name)))
+    with pytest.raises(IntegrationError) as failure:
+        list(store.iter_files(ref))
+    assert failure.value.code == "file_unreadable"
+    assert isinstance(failure.value.__cause__, PermissionError)
+
+
+@pytest.mark.parametrize("content", [b"int f;\x00binary", b"int caf\xff;"])
+def test_scan_still_reports_confirmed_non_text_files(tmp_path, content):
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    staged = store.new_temp_dir()
+    (staged / "a.c").write_bytes(content)
+    store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+    report = ScanReport()
+    assert list(store.iter_files(ref, report=report)) == []
+    assert report.binary == ["a.c"]
+    assert report.scanned == 0

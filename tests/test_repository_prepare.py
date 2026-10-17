@@ -510,3 +510,72 @@ async def test_cancelled_materialization_exits_before_returning_and_never_publis
     finally:
         release.set()
         assert await asyncio.to_thread(stopped.wait, 2)
+
+
+@pytest.mark.parametrize("enabled_in_snapshot", [False, True])
+async def test_function_matching_preserves_line_comment_termination(tmp_path, enabled_in_snapshot):
+    enabled = "void f(void) {\n// disabled\nmemcpy(dst, src, n);\n}"
+    disabled = "void f(void) {\n// disabled memcpy(dst, src, n);\n}"
+    source, func = (enabled, disabled) if enabled_in_snapshot else (disabled, enabled)
+    fake = FakeGit({REPO: {COMMIT: {"a.c": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+        )
+    assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize("prefix", ["u", "my_", "9", "e\u0301", "u\\\n", "u\\\r\n"])
+async def test_function_matching_cannot_start_inside_an_identifier(tmp_path, prefix):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": (prefix + func).encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+        )
+    assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize(
+    ("func", "source"),
+    [
+        (
+            "void f(void) {\n// disabled\nmemcpy(dst, src, n);\n}",
+            "void f(void) { \r\n // disabled   \r\n \tmemcpy(dst, src, n);\r\n }\r\n",
+        ),
+        (
+            'void f(void) { use("// literal"); return; }',
+            'void f(void) {\nuse("// literal");\nreturn;\n}',
+        ),
+        (
+            "void f(void) { /* note */ return; }",
+            "void f(void) {\n/* note\n*/\nreturn;\n}",
+        ),
+        (
+            "int f(void) { return 1; } // trailing note\n",
+            "int f(void) { return 1; } // trailing note",
+        ),
+    ],
+)
+async def test_function_matching_keeps_valid_whitespace_variants(tmp_path, func, source):
+    fake = FakeGit({REPO: {COMMIT: {"a.c": source.encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    assert prepared.func == func
+
+
+async def test_identifier_suffix_does_not_hide_real_function_or_change_text_search(tmp_path):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": "u" + func + "\n" + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == 2
+    found = await adapters.search_code(prepared.snapshot_ref, func)
+    assert [match.start_line for match in found.matches] == [1, 2]

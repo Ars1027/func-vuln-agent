@@ -47,7 +47,7 @@ _RANK = {"definition": 0, "macro": 0, "declaration": 1, "call": 2, "reference": 
 _LINE_SPLICE = r"\\\r?\n"
 _LEXEMES = re.compile(
     # C/C++ 先拼接反斜线换行；直接匹配原文，以保留物理行号和偏移。
-    rf"(?P<comment>/(?:{_LINE_SPLICE})*(?:/(?:{_LINE_SPLICE}|[^\n])*|"
+    rf"(?P<comment>/(?:{_LINE_SPLICE})*(?:(?P<line_comment>/(?:{_LINE_SPLICE}|[^\n])*)|"
     rf"\*[\s\S]*?(?:\*(?:{_LINE_SPLICE})*/|$)))|"
     r"""(?:u8|u|U|L)?R"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"|"""
     r""""(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'"""
@@ -58,21 +58,37 @@ CLASSIFY_LOOKAHEAD = 400
 def normalize_whitespace(
     text: str,
     *,
+    preserve_line_comments: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[int]]:
-    """只折叠字面量外的空白，保留字符、字符串和原始字符串的内容及偏移。"""
+    """折叠字面量外空白；函数比较还保留决定行注释范围的终止换行。"""
     check_scan_cancelled(cancel_event)
     characters: list[str] = []
     offsets: list[int] = []
     previous_space = False
-    literals = (match for match in _LEXEMES.finditer(text) if match.group("comment") is None)
-    literal = next(literals, None)
+    lexemes = _LEXEMES.finditer(text)
+    lexeme = next(lexemes, None)
+    line_comment_end = None
     for offset, character in enumerate(text):
         if cancel_event is not None and offset % 4096 == 0:
             check_scan_cancelled(cancel_event)
-        while literal is not None and offset >= literal.end():
-            literal = next(literals, None)
-        in_literal = literal is not None and literal.start() <= offset < literal.end()
+        while lexeme is not None and offset >= lexeme.end():
+            line_comment_end = lexeme.end() if lexeme.group("line_comment") is not None else None
+            lexeme = next(lexemes, None)
+        in_literal = (
+            lexeme is not None
+            and lexeme.group("comment") is None
+            and lexeme.start() <= offset < lexeme.end()
+        )
+        if preserve_line_comments and character == "\n" and offset == line_comment_end:
+            if previous_space:
+                characters[-1] = "\n"
+                offsets[-1] = offset
+            else:
+                characters.append("\n")
+                offsets.append(offset)
+            previous_space = True
+            continue
         if character.isspace() and not in_literal:
             if previous_space:
                 continue
@@ -87,7 +103,7 @@ def normalize_whitespace(
     while start < len(characters) and characters[start] == " ":
         start += 1
     end = len(characters)
-    while end > start and characters[end - 1] == " ":
+    while end > start and characters[end - 1] in {" ", "\n"}:
         end -= 1
     check_scan_cancelled(cancel_event)
     return "".join(characters[start:end]), offsets[start:end]
@@ -113,7 +129,9 @@ def iter_matches(
     cancel_event: threading.Event | None = None,
 ) -> Iterator[tuple[int, int]]:
     """按原文偏移逐个产出匹配，避免为高频词一次性分配全部结果。"""
-    haystack, offsets = normalize_whitespace(text, cancel_event=cancel_event)
+    haystack, offsets = normalize_whitespace(
+        text, preserve_line_comments=code_offset is not None, cancel_event=cancel_event
+    )
     non_code = _LEXEMES.finditer(text) if code_offset is not None else iter(())
     region = next(non_code, None)
     position = haystack.find(needle)
@@ -121,15 +139,35 @@ def iter_matches(
         check_scan_cancelled(cancel_event)
         start = offsets[position]
         end = offsets[position + len(needle) - 1] + 1
-        in_non_code = False
+        valid_start = True
         if code_offset is not None:
             code_start = offsets[position + code_offset]
             while region is not None and region.end() <= code_start:
                 region = next(non_code, None)
-            in_non_code = region is not None and region.start() <= code_start < region.end()
-        if not in_non_code:
+            valid_start = not (
+                region is not None and region.start() <= code_start < region.end()
+            ) and _starts_at_token_boundary(text, code_start)
+        if valid_start:
             yield start, end
         position = haystack.find(needle, position + len(needle))
+
+
+def _starts_at_token_boundary(text: str, start: int) -> bool:
+    """首个代码标记不能从标识符中间开始；先跨过 C/C++ 的续行。"""
+    previous = start
+    while previous:
+        if text[max(0, previous - 2) : previous] == "\\\n":
+            previous -= 2
+        elif text[max(0, previous - 3) : previous] == "\\\r\n":
+            previous -= 3
+        else:
+            break
+    # 前置 a 使数字、组合字符等合法的标识符续字符也能被识别。
+    return not (
+        previous > 0
+        and ("a" + text[previous - 1]).isidentifier()
+        and ("a" + text[start]).isidentifier()
+    )
 
 
 def _first_code_offset(text: str) -> int | None:
@@ -154,7 +192,9 @@ def locate_function(
     cancel_event: threading.Event | None = None,
 ) -> CodeLocation:
     """在快照中定位待测函数的相对路径与原始行号。"""
-    needle, offsets = normalize_whitespace(func, cancel_event=cancel_event)
+    needle, offsets = normalize_whitespace(
+        func, preserve_line_comments=True, cancel_event=cancel_event
+    )
     first_code = _first_code_offset(func)
     if not needle or first_code is None:
         raise IntegrationError("function_not_found", "待测函数不包含代码，无法在快照中定位。")
