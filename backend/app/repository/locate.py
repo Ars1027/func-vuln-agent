@@ -52,6 +52,12 @@ _LEXEMES = re.compile(
     r"""(?:u8|u|U|L)?R"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"|"""
     r""""(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'"""
 )
+_DECLARATION_TOKENS = re.compile(
+    _LEXEMES.pattern
+    + rf"|(?P<splice>{_LINE_SPLICE})|(?P<newline>\n)"
+    + rf"|(?P<code><(?:{_LINE_SPLICE})*%|%(?:{_LINE_SPLICE})*>|\w+(?:{_LINE_SPLICE}\w+)*|[^\s])"
+)
+_ALTERNATIVE_BRACES = {"<%": "{", "%>": "}"}
 CLASSIFY_LOOKAHEAD = 400
 
 
@@ -132,8 +138,12 @@ def iter_matches(
     haystack, offsets = normalize_whitespace(
         text, preserve_line_comments=code_offset is not None, cancel_event=cancel_event
     )
-    non_code = _LEXEMES.finditer(text) if code_offset is not None else iter(())
-    region = next(non_code, None)
+    starts = (
+        _declaration_starts(text, cancel_event=cancel_event)
+        if code_offset is not None
+        else iter(())
+    )
+    declaration_start = next(starts, None)
     position = haystack.find(needle)
     while position != -1:
         check_scan_cancelled(cancel_event)
@@ -142,32 +152,107 @@ def iter_matches(
         valid_start = True
         if code_offset is not None:
             code_start = offsets[position + code_offset]
-            while region is not None and region.end() <= code_start:
-                region = next(non_code, None)
-            valid_start = not (
-                region is not None and region.start() <= code_start < region.end()
-            ) and _starts_at_token_boundary(text, code_start)
+            while declaration_start is not None and declaration_start < code_start:
+                declaration_start = next(starts, None)
+            valid_start = declaration_start == code_start
         if valid_start:
             yield start, end
         position = haystack.find(needle, position + len(needle))
 
 
-def _starts_at_token_boundary(text: str, start: int) -> bool:
-    """首个代码标记不能从标识符中间开始；先跨过 C/C++ 的续行。"""
-    previous = start
-    while previous:
-        if text[max(0, previous - 2) : previous] == "\\\n":
-            previous -= 2
-        elif text[max(0, previous - 3) : previous] == "\\\r\n":
-            previous -= 3
-        else:
-            break
-    # 前置 a 使数字、组合字符等合法的标识符续字符也能被识别。
-    return not (
-        previous > 0
-        and ("a" + text[previous - 1]).isidentifier()
-        and ("a" + text[start]).isidentifier()
-    )
+def _declaration_starts(text: str, *, cancel_event: threading.Event | None = None) -> Iterator[int]:
+    """单次词法扫描声明起点；换行、注释和预处理指令不截断声明前缀。"""
+    boundary = True
+    depth = 0
+    parameter_lists: list[bool] = []
+    braces: list[tuple[bool, bool]] = []
+    type_definition = False
+    function_declarator = False
+    requires_expression = False
+    requires_parameters = False
+    directive = False
+    previous = ""
+    next_cancel_check = 0
+    for token in _DECLARATION_TOKENS.finditer(text):
+        if cancel_event is not None and token.start() >= next_cancel_check:
+            check_scan_cancelled(cancel_event)
+            next_cancel_check = token.start() + 4096
+        if token.group("comment") is not None or token.group("splice") is not None:
+            continue
+        value = token.group().replace("\\\r\n", "").replace("\\\n", "")
+        value = _ALTERNATIVE_BRACES.get(value, value)
+        if token.start() == 0 and value == "\ufeff":
+            continue
+        if token.group("newline") is not None:
+            directive = False
+            continue
+        if value == "#":
+            if boundary:
+                yield token.start()
+            directive = True
+            continue
+        if directive:
+            continue
+        if boundary and token.group("code") is not None:
+            yield token.start()
+        expression_brace = False
+        type_brace = False
+        closes_requires_parameters = False
+        if value == "(":
+            if depth == 0 and previous not in {
+                "__attribute__",
+                "__attribute",
+                "__declspec",
+                "alignas",
+                "_Alignas",
+            }:
+                function_declarator = True
+            parameter_lists.append(previous == "requires" and requires_expression)
+            depth += 1
+        elif value == "[":
+            depth += 1
+        elif value == ")":
+            closes_requires_parameters = parameter_lists.pop() if parameter_lists else False
+            depth = max(0, depth - 1)
+        elif value == "]":
+            depth = max(0, depth - 1)
+        elif value == "{":
+            # requires 表达式（含可选参数表）仍属于当前声明；其内部不是新函数起点。
+            expression_brace = depth > 0 or previous == "requires" or requires_parameters
+            type_brace = not expression_brace and type_definition and not function_declarator
+            braces.append((expression_brace, type_brace))
+            depth += expression_brace
+        elif value == "}":
+            expression_brace, type_brace = braces.pop() if braces else (False, False)
+            depth = max(0, depth - expression_brace)
+        if depth == 0 and value in {"struct", "class", "union", "enum"}:
+            type_definition = True
+        boundary = (
+            depth == 0
+            and not expression_brace
+            and not (value == "}" and type_brace)
+            and (
+                value in {";", "{", "}"}
+                or (value == ":" and previous in {"public", "protected", "private"})
+            )
+        )
+        if boundary or (value == "}" and type_brace):
+            type_definition = False
+            function_declarator = False
+        # 区分 requires 子句的约束括号与 requires 表达式的参数表。
+        requires_expression = value == "requires" and previous in {
+            "requires",
+            "(",
+            "=",
+            "&",
+            "|",
+            "!",
+            "and",
+            "or",
+            "not",
+        }
+        requires_parameters = closes_requires_parameters
+        previous = value
 
 
 def _first_code_offset(text: str) -> int | None:

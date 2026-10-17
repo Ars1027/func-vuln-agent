@@ -579,3 +579,173 @@ async def test_identifier_suffix_does_not_hide_real_function_or_change_text_sear
     assert location.start_line == location.end_line == 2
     found = await adapters.search_code(prepared.snapshot_ref, func)
     assert [match.start_line for match in found.matches] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "unsigned ",
+        "unsigned\n",
+        "unsigned /* type note; {} */\n",
+        "unsigned // type note; {}\n",
+        "unsigned \\\r\n",
+        "static ",
+        "const\n",
+        "long ",
+        'extern "C" ',
+        "[[nodiscard]]\n",
+        "template<class T>\n",
+        "template<class T> requires requires { typename T::type; }\n",
+        "template<class T> requires requires <% typename T::type; %>\n",
+        "template<class T> requires requires <\\\n% typename T::type; %\\\n>\n",
+        "template<class T> requires requires(T value) { value + value; }\n",
+        "template<class T> requires true && requires(T value) { value + value; }\n",
+        "template<class T> requires not requires(T value) { value + value; }\n",
+        "template<class T> requires requi\\\nres(T value) { value + value; }\n",
+        "template<class T> requires requires { { T{} } -> std::same_as<T>; }\n",
+        "unsigned\n#if FEATURE\n#endif\n",
+        "__attribute__((noinline))\n",
+    ],
+)
+@pytest.mark.parametrize("course", [False, True])
+async def test_function_matching_rejects_incomplete_declaration(tmp_path, prefix, course):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": prefix + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        if course:
+            await adapters.prepare_course(
+                CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+            )
+        else:
+            await adapters.prepare_snapshot(
+                SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+            )
+    assert failure.value.code == "function_not_found"
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("/* documentation */\n", ""),
+        ("int previous; /* unsigned */\n", ""),
+        ("int previous(void) { return 0; }\n", ""),
+        ("int previous(void) <% return 0; %>\n", ""),
+        ("int previous(void) <\\\r\n% return 0; %\\\r\n>\n", ""),
+        ("#include <stdint.h>\n#define FLAG(x) \\\n((x) + 1)\n", ""),
+        ("#define FLAG /* macro\ncomment */ 1\n", ""),
+        ("#define FLAG 1 // macro \\\ncontinued\n", ""),
+        ("\ufeff\n", ""),
+        ("#if FEATURE\n", "\n#endif"),
+        ("namespace N {\n", "\n}"),
+        ("namespace N <%\n", "\n%>"),
+        ("namespace N <\\\n%\n", "\n%\\\n>"),
+        ('extern "C" {\n', "\n}"),
+        ("class C {\npublic:\n", "\n};"),
+    ],
+)
+async def test_complete_function_after_declaration_boundaries_is_located(tmp_path, prefix, suffix):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": prefix + func + suffix}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == prefix.count("\n") + 1
+    assert location.content == func
+
+
+@pytest.mark.parametrize("prefix", ["unsigned ", "unsigned\n", "static\n", 'extern "C" '])
+async def test_complete_declared_function_keeps_its_prefix(tmp_path, prefix):
+    func = prefix + "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": "#include <stdint.h>\n" + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.content == func
+
+
+async def test_declaration_suffix_does_not_hide_real_function_or_change_text_search(tmp_path):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.c": "unsigned\n" + func + "\n" + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == 3
+    assert location.content == func
+    found = await adapters.search_code(prepared.snapshot_ref, func)
+    assert [match.start_line for match in found.matches] == [2, 3]
+
+
+@pytest.mark.parametrize(
+    "previous",
+    [
+        "template<class T> int previous(T) requires (sizeof(T) > 0) { return 0; }",
+        "template<class T> requires requires { typename T::type; }\nint previous(T) { return 0; }",
+        "template<class T> requires requires(T value) { value + value; }\n"
+        "int previous(T) { return 0; }",
+        "template<class T> int previous(T) requires requires(T value) { value + value; }\n"
+        "{ return 0; }",
+    ],
+)
+async def test_constrained_function_and_following_function_are_located(tmp_path, previous):
+    func = "int f(void) { return -1; }"
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": previous + "\n" + func}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.start_line == location.end_line == previous.count("\n") + 2
+    previous_location = await adapters.locate_function(prepared.snapshot_ref, previous)
+    assert previous_location.content == previous
+
+
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("struct S { int x; } ", "f(void) { struct S s; return s; }"),
+        ("struct S <% int x; %> ", "f(void) { struct S s; return s; }"),
+        ("union U { int x; }\n", "f(void) { union U u; return u; }"),
+        ("enum E { NEG = -1 }\n", "f(void) { return NEG; }"),
+        (
+            "struct __attribute__((packed)) S { int x; }\n",
+            "f(void) { struct S s; return s; }",
+        ),
+    ],
+)
+async def test_inline_return_type_is_part_of_complete_declaration(tmp_path, prefix, suffix):
+    func = prefix + suffix
+    fake = FakeGit({REPO: {COMMIT: {"a.c": func}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.prepare_snapshot(
+            SnapshotRequest(idx=1, func=suffix, commit_url=COMMIT_URL, revision="commit")
+        )
+    assert failure.value.code == "function_not_found"
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.content == func
+
+
+@pytest.mark.parametrize("qualifier", ["", " noexcept"])
+async def test_named_return_type_keeps_following_declaration_boundary(tmp_path, qualifier):
+    func = "int f(void) { return -1; }"
+    previous = f"struct S previous(void){qualifier} {{ struct S s; return s; }}"
+    source = "struct S { int x; };\n" + previous + "\n" + func
+    fake = FakeGit({REPO: {COMMIT: {"a.cpp": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    previous_location = await adapters.locate_function(prepared.snapshot_ref, previous)
+    assert previous_location.content == previous

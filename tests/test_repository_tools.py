@@ -434,7 +434,7 @@ async def test_search_deduplication_preserves_multiline_ranges_and_match_budget(
     from app.repository.locate import search_code
 
     func = "int entry(void) { return 1; }"
-    text = "foo\nbar foo\nbar\nfoo\nbar\n" + func
+    text = "/* foo\nbar foo\nbar\nfoo\nbar */\n" + func
     fake = FakeGit({REPO: {COMMIT: {"a.c": text}}})
     adapters = RepositoryAdapters(tmp_path / "storage", git=fake, resolver=public_resolver)
     prepared = await adapters.prepare_course(
