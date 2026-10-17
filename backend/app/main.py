@@ -6,6 +6,8 @@ from pathlib import Path
 from app.agent import AgentRunner, openai_model_factory
 from app.api.service import create_app
 from app.integrations import UnavailableAdapters
+from app.repository import RepositoryAdapters
+from app.repository.urls import DEFAULT_ALLOWED_HOSTS
 from app.schemas.models import RunConfig
 from app.schemas.ports import IntegrationError, Services
 
@@ -29,18 +31,30 @@ def configured_model(config: RunConfig):
     return openai_model_factory(config)
 
 
+def load_allowed_hosts() -> tuple[str, ...]:
+    value = os.getenv("FVA_REPOSITORY_HOSTS")
+    if not value:
+        return DEFAULT_ALLOWED_HOSTS
+    hosts = tuple(host.strip().lower() for host in value.split(",") if host.strip())
+    return hosts or DEFAULT_ALLOWED_HOSTS
+
+
 def build_app():
     config = load_config()
-    adapters = UnavailableAdapters()
+    unavailable = UnavailableAdapters()
+    repository = RepositoryAdapters(
+        os.getenv("FVA_STORAGE_DIR", "storage"),
+        allowed_hosts=load_allowed_hosts(),
+    )
     services = Services(
         runner=AgentRunner(
-            repository=adapters,
-            retriever=adapters,
+            repository=repository,
+            retriever=unavailable,
             model_factory=configured_model,
             config=config,
         ),
-        preparation=adapters,
-        exporter=adapters,
+        preparation=repository,
+        exporter=unavailable,
         config=config,
     )
     return create_app(

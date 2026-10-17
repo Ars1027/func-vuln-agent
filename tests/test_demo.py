@@ -80,6 +80,7 @@ def test_manual_snapshot_and_single_detection(tmp_path):
 
 def test_real_factory_never_silently_uses_demo(tmp_path, monkeypatch):
     monkeypatch.setenv("FVA_DB_PATH", str(tmp_path / "real.db"))
+    monkeypatch.setenv("FVA_STORAGE_DIR", str(tmp_path / "storage"))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("FVA_MODEL", raising=False)
     with TestClient(build_app()) as client:
@@ -104,5 +105,6 @@ def test_real_factory_never_silently_uses_demo(tmp_path, monkeypatch):
                 "revision": "commit",
             },
         )
-        assert response.status_code == 503
-        assert response.json()["code"] == "dependency_unavailable"
+        assert response.status_code == 422
+        # 真实准备层按允许的托管主机校验链接，不再回退到演示数据。
+        assert response.json()["code"] == "unsupported_host"
