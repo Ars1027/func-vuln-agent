@@ -129,6 +129,7 @@ class SubprocessGitClient:
         max_files: int = 200_000,
         max_bytes: int = 256 * 1024 * 1024,
         max_total_bytes: int | None = 2 * 1024 * 1024 * 1024,
+        min_idle_seconds: float = 600.0,
         allow_local_transport: bool = False,
     ) -> None:
         self.mirror_root = Path(mirror_root)
@@ -138,6 +139,9 @@ class SubprocessGitClient:
         self.max_files = max_files
         self.max_bytes = max_bytes
         self.max_total_bytes = max_total_bytes
+        self.min_idle_seconds = min_idle_seconds
+        # 镜像回收必须跨仓库串行；空闲窗口避免删除其他请求正在使用的镜像。
+        self._quota_lock = threading.Lock()
         # 仅测试用：允许 file:// 与本地路径（生产环境保持 False）。
         self.allow_local_transport = allow_local_transport
         self._locks: dict[str, threading.Lock] = {}
@@ -316,6 +320,10 @@ class SubprocessGitClient:
             self._ensure_remote(mirror, repo_url)
             if not self.has_commit(mirror, commit):
                 self._fetch_commit(mirror, commit, options=options, cancel_event=cancel_event)
+            try:
+                os.utime(mirror)
+            except OSError:
+                pass
             self._enforce_mirror_quota(keep=mirror)
         return mirror
 
@@ -500,18 +508,33 @@ class SubprocessGitClient:
     def _enforce_mirror_quota(self, *, keep: Path) -> None:
         if self.max_total_bytes is None or not self.mirror_root.is_dir():
             return
-        mirrors = [path for path in self.mirror_root.iterdir() if path.is_dir()]
-        sizes = {path: _directory_size(path) for path in mirrors}
-        total = sum(sizes.values())
-        for path in sorted(mirrors, key=lambda item: item.stat().st_mtime):
-            if total <= self.max_total_bytes:
-                break
-            if path == keep:
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            total -= sizes[path]
-        if total > self.max_total_bytes:
-            raise IntegrationError("storage_quota_exceeded", "快照镜像存储配额已用尽。")
+        with self._quota_lock:
+            mirrors = [path for path in self.mirror_root.iterdir() if path.is_dir()]
+            sizes = {}
+            for path in mirrors:
+                try:
+                    sizes[path] = _directory_size(path)
+                except OSError:
+                    sizes[path] = 0
+            total = sum(sizes.values())
+            now = time.time()
+            for path in sorted(
+                mirrors, key=lambda item: item.stat().st_mtime if item.exists() else 0
+            ):
+                if total <= self.max_total_bytes:
+                    break
+                if path == keep:
+                    continue
+                try:
+                    idle = now - path.stat().st_mtime
+                except OSError:
+                    continue
+                if idle < self.min_idle_seconds:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                total -= sizes[path]
+            if total > self.max_total_bytes:
+                raise IntegrationError("storage_quota_exceeded", "快照镜像存储配额已用尽。")
 
 
 def _relative_path(raw: bytes) -> str:

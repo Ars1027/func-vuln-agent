@@ -50,11 +50,13 @@ storage/
 `snapshot_ref` 为 `snap-<16 位十六进制>`，由仓库地址与提交哈希派生，不携带标签或选版
 语义。物化直接读取提交树 blob，不应用 `export-ignore` / `export-subst`；只导出普通文件，
 跳过符号链接、子模块与 `.git` 条目，拒绝含反斜杠、`..`、空段或非 UTF-8 的歧义路径。
-单快照默认上限 200000 个文件 / 256 MiB，镜像与快照各默认 2 GiB 总量配额；超限时按最旧
-优先回收缓存，仍超限返回 `storage_quota_exceeded`。元数据先写、文件树后原子改名，发布
-按 `snapshot_ref` 串行且幂等，重试会清理上次中断留下的孤儿目录；启动时清理 `tmp/`
-残留。文本读取只接受 UTF-8（无 NUL 字节），否则 `file_unreadable`。工具只接受登记过的
-`snapshot_ref`，格式错误或未登记一律 `snapshot_not_found`，不按路径猜测其他快照。
+单快照默认上限 200000 个文件 / 256 MiB，镜像与快照各默认 2 GiB 总量配额。配额计算与
+回收在存储/镜像缓存范围内串行，并只回收空闲超过 `min_idle_seconds`（默认 600s）的条目，
+避免并发请求互相删除仍在使用的目录；空间不足且无法安全回收时返回
+`storage_quota_exceeded`。元数据先写、文件树后原子改名，发布按 `snapshot_ref` 串行且
+幂等，重试会清理上次中断留下的孤儿目录；启动时清理 `tmp/` 残留。文本读取只接受 UTF-8
+（无 NUL 字节），否则 `file_unreadable`。工具只接受登记过的 `snapshot_ref`，格式错误或
+未登记一律 `snapshot_not_found`，不按路径猜测其他快照。
 
 ## 4. 证据工具
 
@@ -64,10 +66,13 @@ storage/
 | `read_file(path, start_line, end_line)` | 按 1 起始行号流式读取原文，`end_line` 超出文件时钳制并在 `scope` 说明 | 单次最多 400 行，超限 `range_too_large`；起始行越界 `line_out_of_range` |
 | `find_symbol(symbol)` | 按标识符边界定位定义、`#define` 宏、声明、调用与其他引用 | 依据括号/花括号与作用域文本形态分类，头文件中的 `name(...);` 视为声明，命名空间/类作用域变量视为定义；注释与字符串不剔除；默认最多 20 条 |
 
-扫描会记录被排除的文件：超过单文件扫描上限的记入 `scope` 的 `skipped ... oversized`，
-非文本文件记入 `skipped ... non-text`；`locate_function` 找不到函数时也会在错误信息中
-说明这些缺口。`find_symbol` 的出现次数超过 `max_occurrences` 后只停止计数，仍继续扫描以
-保留后续定义，并在 `scope` 标注 `counts beyond N were not tallied`。
+扫描覆盖 C/C++ 常见后缀（含 `.cc/.cpp/.cxx/.hpp/.tcc/.tpp/.ii/.cu/.cuh/.ixx/.cppm` 等）
+以及含预处理指令的无扩展名头文件；被判为其他类型的文件会计入 `scope` 的
+`skipped ... other extensions`，超过单文件扫描上限的记入 `oversized`，非文本文件记入
+`non-text`；`locate_function` 找不到函数时也会在错误信息中说明这些缺口。符号扫描预算按
+文件字节数计算，避免多字节文本绕过 64 MiB 上限。`find_symbol` 的出现次数超过
+`max_occurrences` 后只停止计数，仍继续扫描以保留后续定义，并在 `scope` 标注
+`counts beyond N were not tallied`。
 
 `find_symbol` 返回顺序为定义/宏、声明、调用、其他引用，`scope` 列出前若干条的
 `路径:行号 分类` 与统计，便于 Agent 追踪辅助函数、调用方与全局变量。`locate_function`
@@ -98,13 +103,13 @@ python -m ruff format --check .
 python -m pytest -q
 ```
 
-本机结果：`150 passed`，ruff 检查与格式检查通过。新增测试：
+本机结果：`155 passed`，ruff 检查与格式检查通过。新增测试：
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/test_repository_prepare.py` | `target=1/0` 与 `revision=commit/parent` 选版一致、`idx/func` 保留且结果不含选版信息、重复准备复用快照且不再解析 DNS、地址固定参数、快照间隔离、引用不可猜测、多父提交、根提交、仓库/提交缺失、函数不一致与重复、URL 白名单、私网与 DNS 失败 |
-| `tests/test_repository_tools.py` | 行号与原文一致、`end_line` 钳制、行区间上限、缺失文件、目录穿越、`.git` 路径、二进制与非 UTF-8 文件、隐藏目录扫描、搜索命中/无命中/截断/按大小排除、边界检查与检查后数据变化、定义与声明与调用与注释引用分类、相似标识符不合并、宏、命名空间全局变量、跨文件调用路径、出现次数截断仍保留定义、非法符号、未知快照引用 |
-| `tests/test_repository_store.py` | 发布幂等、孤儿目录修复、同一引用并发发布、临时目录清理、总配额按最旧回收、二进制与非 UTF-8 文本拒绝 |
+| `tests/test_repository_tools.py` | 行号与原文一致、`end_line` 钳制、行区间上限、缺失文件、目录穿越、`.git` 路径、二进制与非 UTF-8 文件、隐藏目录与 `.tcc`/无扩展名头文件扫描、搜索命中/无命中/截断/按大小排除、符号扫描字节预算、边界检查与检查后数据变化、定义与声明与调用与注释引用分类、相似标识符不合并、宏、命名空间全局变量、跨文件调用路径、出现次数截断仍保留定义、非法符号、未知快照引用 |
+| `tests/test_repository_store.py` | 发布幂等、孤儿目录修复、同一引用并发发布、并发发布共享配额、临时目录清理、按最旧回收、镜像回收跳过在用目录、二进制与非 UTF-8 文本拒绝 |
 | `tests/test_repository_git.py` | 真实 Git：拉取提交、解析父提交、按提交导出、不应用 `export-ignore`、快照不含 `.git`、镜像缓存复用、缺失仓库与提交、子进程安全参数与配置注入清理、歧义路径拒绝 |
 
 `tests/test_repository_*.py` 的仓库内容均为人工编写的合成 C 片段，配合内存 `FakeGit`

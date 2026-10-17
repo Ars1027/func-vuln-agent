@@ -82,6 +82,65 @@ def test_storage_quota_evicts_oldest_snapshot(tmp_path):
     assert not store.exists(old)
 
 
+def test_concurrent_publications_respect_shared_quota(tmp_path):
+    store = SnapshotStore(tmp_path / "storage", max_total_bytes=12)
+    refs = [store.ref_for(REPO, str(index) * 40) for index in (1, 2)]
+    outcomes: list[str] = []
+
+    def worker(ref: str) -> None:
+        try:
+            store.publish(stage(store, "x.c", "int value;\n"), ref, repo_url=REPO, commit="1" * 40)
+            outcomes.append("ok")
+        except IntegrationError as exc:
+            outcomes.append(exc.code)
+
+    threads = [threading.Thread(target=worker, args=(ref,)) for ref in refs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["ok", "storage_quota_exceeded"]
+    assert len([ref for ref in refs if store.exists(ref)]) == 1
+
+
+def test_mirror_quota_evicts_idle_mirror_only(tmp_path):
+    from app.repository.gitclient import SubprocessGitClient
+
+    root = tmp_path / "mirrors"
+    root.mkdir()
+    old = root / "old.git"
+    fresh = root / "fresh.git"
+    for path in (old, fresh):
+        path.mkdir()
+        (path / "pack").write_bytes(b"x" * 8)
+    os.utime(old, (1, 1))
+
+    client = SubprocessGitClient(root, max_total_bytes=12, min_idle_seconds=600)
+    client._enforce_mirror_quota(keep=fresh)
+
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_mirror_quota_keeps_recently_used_mirrors(tmp_path):
+    from app.repository.gitclient import SubprocessGitClient
+
+    root = tmp_path / "mirrors"
+    root.mkdir()
+    first = root / "first.git"
+    second = root / "second.git"
+    for path in (first, second):
+        path.mkdir()
+        (path / "pack").write_bytes(b"x" * 8)
+
+    client = SubprocessGitClient(root, max_total_bytes=12, min_idle_seconds=600)
+    with pytest.raises(IntegrationError) as exhausted:
+        client._enforce_mirror_quota(keep=first)
+    assert exhausted.value.code == "storage_quota_exceeded"
+    assert first.exists() and second.exists()
+
+
 def test_read_text_rejects_binary_and_invalid_utf8(tmp_path):
     store = SnapshotStore(tmp_path / "storage")
     ref = store.ref_for(REPO, "1" * 40)

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -30,28 +31,42 @@ CODE_SUFFIXES = frozenset(
         ".hh",
         ".hpp",
         ".hxx",
+        ".h++",
+        ".c++",
         ".inl",
         ".ipp",
+        ".tcc",
+        ".tpp",
+        ".ii",
+        ".cu",
+        ".cuh",
+        ".ixx",
+        ".cppm",
+        ".mpp",
         ".inc",
         ".m",
         ".mm",
     }
 )
+# 无扩展名的 C/C++ 头文件（如 `include/foo`）按预处理指令识别。
+_SOURCE_DIRECTIVE = re.compile(r"^\s*#\s*(?:include|define|pragma|ifndef|if)\b", re.M)
 
 
 @dataclass(frozen=True)
 class FileEntry:
     path: str
     text: str
+    size: int
 
 
 @dataclass
 class ScanReport:
-    """扫描范围的可核对记录：被排除的文件会进入 `oversized`/`binary`。"""
+    """扫描范围的可核对记录：被排除的文件会进入 `oversized`/`binary`/`excluded`。"""
 
     scanned: int = 0
     oversized: list[str] = field(default_factory=list)
     binary: list[str] = field(default_factory=list)
+    excluded: int = 0
 
     def note(self) -> str:
         parts = []
@@ -59,20 +74,32 @@ class ScanReport:
             parts.append(f"skipped {len(self.oversized)} oversized file(s)")
         if self.binary:
             parts.append(f"skipped {len(self.binary)} non-text file(s)")
+        if self.excluded:
+            parts.append(f"skipped {self.excluded} file(s) with other extensions")
         return "; ".join(parts)
 
 
 class SnapshotStore:
     """`storage/` 下的快照存储：`snapshots/<ref>/` 为文件树，`refs/<ref>.json` 为元数据。"""
 
-    def __init__(self, root: str | Path, *, max_total_bytes: int | None = 2 * 1024**3) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        max_total_bytes: int | None = 2 * 1024**3,
+        min_idle_seconds: float = 600.0,
+    ) -> None:
         self.root = Path(root)
         self.snapshots = self.root / "snapshots"
         self.refs = self.root / "refs"
         self.temp = self.root / "tmp"
         self.max_total_bytes = max_total_bytes
+        self.min_idle_seconds = min_idle_seconds
         self._publish_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        # 配额计算与回收必须跨引用串行，否则并发发布可能互相删除刚发布的快照。
+        self._quota_lock = threading.Lock()
+        self._reserved_bytes = 0
 
     def ref_for(self, repo_url: str, commit: str) -> str:
         digest = hashlib.sha256(f"{repo_url}\n{commit}".encode()).hexdigest()[:16]
@@ -126,12 +153,18 @@ class SnapshotStore:
             # 只有元数据存在时该目录才可用，因此无元数据的目录是上次中断的残留。
             if destination.exists():
                 shutil.rmtree(destination, ignore_errors=True)
-            self._write_metadata(snapshot_ref, repo_url, commit)
+            size = _directory_size(staged)
+            self._reserve_quota(size, keep=snapshot_ref)
             try:
-                os.replace(staged, destination)
-            except OSError as exc:
-                raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
-            self._enforce_quota(keep=snapshot_ref)
+                self._write_metadata(snapshot_ref, repo_url, commit)
+                try:
+                    os.replace(staged, destination)
+                except OSError as exc:
+                    raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
+            except BaseException:
+                self._release_quota(size)
+                raise
+            self._release_quota(size)
 
     def _publish_lock(self, snapshot_ref: str) -> threading.Lock:
         with self._locks_guard:
@@ -148,27 +181,49 @@ class SnapshotStore:
             temporary.unlink(missing_ok=True)
             raise IntegrationError("snapshot_write_failed", "保存快照失败。") from exc
 
-    def _enforce_quota(self, *, keep: str) -> None:
-        if self.max_total_bytes is None or not self.refs.is_dir():
+    def _reserve_quota(self, size: int, *, keep: str) -> None:
+        """跨引用串行地预留空间；只回收空闲足够久的快照，避免误删使用中的树。"""
+        if self.max_total_bytes is None:
             return
-        entries = sorted(
-            (path for path in self.refs.glob("snap-*.json")),
-            key=lambda path: path.stat().st_mtime,
+        with self._quota_lock:
+            total = self._snapshot_bytes() + self._reserved_bytes
+            if total + size > self.max_total_bytes and self.refs.is_dir():
+                entries = sorted(
+                    (path for path in self.refs.glob("snap-*.json")),
+                    key=lambda path: path.stat().st_mtime,
+                )
+                now = time.time()
+                for ref_file in entries:
+                    if total + size <= self.max_total_bytes:
+                        break
+                    snapshot_ref = ref_file.stem
+                    if snapshot_ref == keep:
+                        continue
+                    try:
+                        idle = now - ref_file.stat().st_mtime
+                    except OSError:
+                        continue
+                    if idle < self.min_idle_seconds:
+                        continue
+                    tree = self.snapshots / snapshot_ref
+                    freed = _directory_size(tree)
+                    shutil.rmtree(tree, ignore_errors=True)
+                    ref_file.unlink(missing_ok=True)
+                    total -= freed
+            if total + size > self.max_total_bytes:
+                raise IntegrationError("storage_quota_exceeded", "快照存储配额已用尽。")
+            self._reserved_bytes += size
+
+    def _release_quota(self, size: int) -> None:
+        with self._quota_lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - size)
+
+    def _snapshot_bytes(self) -> int:
+        if not self.refs.is_dir():
+            return 0
+        return sum(
+            _directory_size(self.snapshots / path.stem) for path in self.refs.glob("snap-*.json")
         )
-        total = sum(_directory_size(self.snapshots / path.stem) for path in entries)
-        for ref_file in entries:
-            if total <= self.max_total_bytes:
-                break
-            snapshot_ref = ref_file.stem
-            if snapshot_ref == keep:
-                continue
-            tree = self.snapshots / snapshot_ref
-            size = _directory_size(tree)
-            shutil.rmtree(tree, ignore_errors=True)
-            ref_file.unlink(missing_ok=True)
-            total -= size
-        if total > self.max_total_bytes:
-            raise IntegrationError("storage_quota_exceeded", "快照存储配额已用尽。")
 
     def resolve_file(self, snapshot_ref: str, path: str) -> tuple[str, Path]:
         """返回规范化相对路径与磁盘路径；解析符号链接后仍须位于快照内。"""
@@ -261,14 +316,17 @@ class SnapshotStore:
                 if filename.casefold() == ".git":
                     continue
                 path = Path(directory) / filename
-                if path.suffix.lower() not in suffixes:
-                    continue
                 relative = path.relative_to(root).as_posix()
                 try:
                     stat = path.stat()
                 except OSError:
                     continue
                 if not path.is_file() or path.is_symlink():
+                    continue
+                suffix = path.suffix.lower()
+                if suffix not in suffixes and not (suffix == "" and _looks_like_source(path)):
+                    if report is not None:
+                        report.excluded += 1
                     continue
                 if stat.st_size > max_bytes:
                     if report is not None:
@@ -282,12 +340,27 @@ class SnapshotStore:
                     continue
                 if report is not None:
                     report.scanned += 1
-                yield FileEntry(path=relative, text=text)
+                yield FileEntry(path=relative, text=text, size=stat.st_size)
 
     def source_files(
         self, snapshot_ref: str, *, max_bytes: int = 2 * 1024 * 1024
     ) -> list[FileEntry]:
         return list(self.iter_files(snapshot_ref, max_bytes=max_bytes))
+
+
+def _looks_like_source(path: Path, preview_bytes: int = 4096) -> bool:
+    """无扩展名文件是否像 C/C++ 头文件（含预处理指令）。"""
+    try:
+        head = path.read_bytes()[:preview_bytes]
+    except OSError:
+        return False
+    if b"\x00" in head:
+        return False
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return bool(_SOURCE_DIRECTIVE.search(text))
 
 
 def _directory_size(path: Path) -> int:

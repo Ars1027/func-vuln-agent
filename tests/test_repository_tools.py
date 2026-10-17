@@ -76,6 +76,9 @@ FILES = {
     "src/order.c": ORDER_C,
     "src/cxx.cpp": CXX,
     ".hidden/util.c": "int hidden_helper(void) { return 1; }\n",
+    "src/traits.tcc": "int template_value(void) { return 1; }\n",
+    "include/ext_header": ("#define EXT_HELPER 1\nint ext_helper(void) { return EXT_HELPER; }\n"),
+    "LICENSE": "Copyright text without C directives.\n",
     "README.md": README,
     "assets/blob.bin": b"\x00\x01binary",
     "assets/latin1.c": b"int caf\xe9;\n",
@@ -246,6 +249,26 @@ async def test_hidden_directories_are_scanned(snapshot):
     adapters, ref = snapshot
     result = await adapters.find_symbol(ref, "hidden_helper")
     assert (result.matches[0].path, result.matches[0].start_line) == (".hidden/util.c", 1)
+
+
+async def test_extended_and_extensionless_sources_are_scanned(snapshot):
+    adapters, ref = snapshot
+    template = await adapters.find_symbol(ref, "template_value")
+    assert (template.matches[0].path, template.matches[0].start_line) == ("src/traits.tcc", 1)
+
+    extensionless = await adapters.find_symbol(ref, "ext_helper")
+    assert (extensionless.matches[0].path, extensionless.matches[0].start_line) == (
+        "include/ext_header",
+        2,
+    )
+
+
+async def test_symbol_scan_budget_reports_byte_limit(snapshot):
+    from app.repository.locate import find_symbol as locate_symbol
+
+    adapters, ref = snapshot
+    result = locate_symbol(adapters.store, ref, "capacity", scan_byte_budget=5)
+    assert "scan stopped after 5 bytes" in result.scope
 
 
 async def test_namespace_scope_variable_counts_as_definition(snapshot):

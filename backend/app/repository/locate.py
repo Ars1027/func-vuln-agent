@@ -326,7 +326,7 @@ def find_symbol(
     count_truncated = False
     scan_truncated = False
     for entry in store.iter_files(snapshot_ref, max_bytes=max_file_bytes, report=report):
-        scanned_bytes += len(entry.text)
+        scanned_bytes += entry.size
         if scanned_bytes > scan_byte_budget:
             scan_truncated = True
             break
