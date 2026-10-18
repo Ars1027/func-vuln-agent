@@ -409,6 +409,34 @@ def test_missing_task_and_unavailable_snapshot(tmp_path):
         assert response.json()["code"] == "adapter_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("unsupported_commit_url", 422),
+        ("unsupported_host", 422),
+        ("network_unavailable", 503),
+    ],
+)
+def test_snapshot_input_errors_are_distinct_from_service_failures(tmp_path, code, status):
+    class FailedPreparation(Preparation):
+        async def prepare_snapshot(self, request):
+            raise IntegrationError(code, "snapshot failed")
+
+    app, _, _ = app_for(tmp_path / "tasks.db", preparation=FailedPreparation())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/snapshots",
+            json={
+                "idx": "sample",
+                "func": "f",
+                "commit_url": "u",
+                "revision": "commit",
+            },
+        )
+        assert response.status_code == status
+        assert response.json()["code"] == code
+
+
 def test_preparation_timeout_and_unexpected_adapter_errors_are_recorded(tmp_path, caplog):
     class SlowPreparation(Preparation):
         async def prepare_course(self, sample):
