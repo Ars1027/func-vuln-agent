@@ -62,19 +62,46 @@ _LEXEMES = re.compile(
 _DECLARATION_TOKENS = re.compile(
     _LEXEMES.pattern
     + rf"|(?P<splice>{_LINE_SPLICE})|(?P<newline>\n)"
-    + rf"|(?P<code><(?:{_LINE_SPLICE})*%|%(?:{_LINE_SPLICE})*>|\w+(?:{_LINE_SPLICE}\w+)*|[^\s])"
+    + rf"|(?P<code><(?:{_LINE_SPLICE})*%|%(?:{_LINE_SPLICE})*[>:]|\w+(?:{_LINE_SPLICE}\w+)*|[^\s])"
 )
-_ALTERNATIVE_BRACES = {"<%": "{", "%>": "}"}
+_ALTERNATIVE_PUNCTUATORS = {"<%": "{", "%>": "}", "%:": "#"}
 CLASSIFY_LOOKAHEAD = 400
+
+
+def _directive_line_ends(
+    text: str, *, cancel_event: threading.Event | None = None
+) -> Iterator[int]:
+    """产出预处理指令终止换行；注释、字面量和续行中的换行不结束逻辑行。"""
+    logical_start = True
+    directive = False
+    next_cancel_check = 0
+    for token in _DECLARATION_TOKENS.finditer(text):
+        if cancel_event is not None and token.start() >= next_cancel_check:
+            check_scan_cancelled(cancel_event)
+            next_cancel_check = token.start() + 4096
+        if token.group("comment") is not None or token.group("splice") is not None:
+            continue
+        if token.group("newline") is not None:
+            if directive:
+                yield token.start()
+            logical_start = True
+            directive = False
+            continue
+        value = token.group().replace("\\\r\n", "").replace("\\\n", "")
+        if token.start() == 0 and value == "\ufeff":
+            continue
+        if logical_start and _ALTERNATIVE_PUNCTUATORS.get(value, value) == "#":
+            directive = True
+        logical_start = False
 
 
 def normalize_whitespace(
     text: str,
     *,
-    preserve_line_comments: bool = False,
+    preserve_logical_lines: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, list[int]]:
-    """折叠字面量外空白；函数比较还保留决定行注释范围的终止换行。"""
+    """折叠字面量外空白；函数比较保留行注释和预处理指令的终止换行。"""
     check_scan_cancelled(cancel_event)
     characters: list[str] = []
     offsets: list[int] = []
@@ -82,9 +109,17 @@ def normalize_whitespace(
     lexemes = _LEXEMES.finditer(text)
     lexeme = next(lexemes, None)
     line_comment_end = None
+    directive_ends = (
+        _directive_line_ends(text, cancel_event=cancel_event)
+        if preserve_logical_lines
+        else iter(())
+    )
+    directive_end = next(directive_ends, None)
     for offset, character in enumerate(text):
         if cancel_event is not None and offset % 4096 == 0:
             check_scan_cancelled(cancel_event)
+        while directive_end is not None and directive_end < offset:
+            directive_end = next(directive_ends, None)
         while lexeme is not None and offset >= lexeme.end():
             line_comment_end = lexeme.end() if lexeme.group("line_comment") is not None else None
             lexeme = next(lexemes, None)
@@ -94,7 +129,11 @@ def normalize_whitespace(
             and lexeme.group("number") is None
             and lexeme.start() <= offset < lexeme.end()
         )
-        if preserve_line_comments and character == "\n" and offset == line_comment_end:
+        if (
+            preserve_logical_lines
+            and character == "\n"
+            and offset in (line_comment_end, directive_end)
+        ):
             if previous_space:
                 characters[-1] = "\n"
                 offsets[-1] = offset
@@ -144,7 +183,7 @@ def iter_matches(
 ) -> Iterator[tuple[int, int]]:
     """按原文偏移逐个产出匹配，避免为高频词一次性分配全部结果。"""
     haystack, offsets = normalize_whitespace(
-        text, preserve_line_comments=code_offset is not None, cancel_event=cancel_event
+        text, preserve_logical_lines=code_offset is not None, cancel_event=cancel_event
     )
     starts = (
         _declaration_starts(text, cancel_event=cancel_event)
@@ -188,7 +227,7 @@ def _declaration_starts(text: str, *, cancel_event: threading.Event | None = Non
         if token.group("comment") is not None or token.group("splice") is not None:
             continue
         value = token.group().replace("\\\r\n", "").replace("\\\n", "")
-        value = _ALTERNATIVE_BRACES.get(value, value)
+        value = _ALTERNATIVE_PUNCTUATORS.get(value, value)
         if token.start() == 0 and value == "\ufeff":
             continue
         if token.group("newline") is not None:
@@ -286,7 +325,7 @@ def locate_function(
 ) -> CodeLocation:
     """在快照中定位待测函数的相对路径与原始行号。"""
     needle, offsets = normalize_whitespace(
-        func, preserve_line_comments=True, cancel_event=cancel_event
+        func, preserve_logical_lines=True, cancel_event=cancel_event
     )
     first_code = _first_code_offset(func)
     if not needle or first_code is None:

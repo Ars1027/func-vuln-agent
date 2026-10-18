@@ -242,6 +242,48 @@ def test_extensionless_preview_uses_a_bounded_read(tmp_path, monkeypatch):
     assert _looks_like_source(path)
 
 
+@pytest.mark.parametrize(
+    ("character", "cut"),
+    [("é", 1), ("界", 1), ("界", 2), ("😀", 1), ("😀", 2), ("😀", 3)],
+)
+def test_extensionless_preview_accepts_an_incomplete_final_code_point(tmp_path, character, cut):
+    from app.repository.store import _looks_like_source
+
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    prefix = "#ifndef HEADER\n/*"
+    prefix += "a" * (4096 - cut - len(prefix))
+    content = prefix + character + "*/\nint value;\n#endif\n"
+    staged = store.new_temp_dir()
+    (staged / "header").write_bytes(content.encode("utf-8"))
+    store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+    path = store.snapshot_dir(ref) / "header"
+    assert _looks_like_source(path)
+    report = ScanReport()
+    files = list(store.iter_files(ref, report=report))
+    assert len(files) == 1 and files[0].path == "header"
+    assert files[0].text == content
+    assert report.scanned == 1 and report.excluded == 0 and report.binary == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"#define VALUE 1\n\xff",
+        b"#define VALUE 1\n\xc3",
+        b"#define VALUE 1\n" + b"a" * (4095 - len(b"#define VALUE 1\n")) + b"\xc3(",
+        b"#define VALUE 1\n" + b"a" * (4095 - len(b"#define VALUE 1\n")) + b"\xc3",
+    ],
+)
+def test_extensionless_scan_still_rejects_invalid_utf8(tmp_path, content):
+    store = SnapshotStore(tmp_path / "storage")
+    ref = store.ref_for(REPO, "1" * 40)
+    staged = store.new_temp_dir()
+    (staged / "header").write_bytes(content)
+    store.publish(staged, ref, repo_url=REPO, commit="1" * 40)
+    assert list(store.iter_files(ref)) == []
+
+
 def test_oversized_extensionless_files_are_skipped_before_preview(tmp_path, monkeypatch):
     from app.repository import store as store_module
 

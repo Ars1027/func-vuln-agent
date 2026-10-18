@@ -4,6 +4,7 @@
 因此模型可读的文件树里没有提交、标签、版本或 Git 元数据。
 """
 
+import codecs
 import hashlib
 import io
 import json
@@ -368,7 +369,8 @@ def _looks_like_source(path: Path, preview_bytes: int = 4096) -> bool:
     if b"\x00" in head:
         return False
     try:
-        text = head.decode("utf-8")
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = decoder.decode(head, final=len(head) < preview_bytes)
     except UnicodeDecodeError:
         return False
     return bool(_SOURCE_DIRECTIVE.search(text))

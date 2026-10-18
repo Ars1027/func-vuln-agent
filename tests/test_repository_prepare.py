@@ -827,3 +827,103 @@ async def test_numeric_tokens_do_not_consume_prefixed_character_literals(tmp_pat
     location = await adapters.locate_function(prepared.snapshot_ref, func)
     assert location.start_line == location.end_line == literal.count("\n") + 2
     assert location.content == func
+
+
+@pytest.mark.parametrize("marker", ["#", "%:", "%\\\n:"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("enabled_in_snapshot", [False, True])
+@pytest.mark.parametrize("course", [False, True])
+async def test_directive_termination_cannot_hide_executable_code(
+    tmp_path, marker, newline, enabled_in_snapshot, course
+):
+    header = "void f(char *dst, const char *src, int n) {" + newline
+    copy = "memcpy(dst, src, n);"
+    enabled = header + marker + "define UNUSED" + newline + copy + newline + "}"
+    disabled = header + marker + "define UNUSED " + copy + newline + "}"
+    source, func = (enabled, disabled) if enabled_in_snapshot else (disabled, enabled)
+    fake = FakeGit({REPO: {COMMIT: {"a.c": source.encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    with pytest.raises(IntegrationError) as failure:
+        if course:
+            await adapters.prepare_course(
+                CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+            )
+        else:
+            await adapters.prepare_snapshot(
+                SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+            )
+    assert failure.value.code == "function_not_found"
+    snapshot_ref = adapters.store.ref_for(REPO, COMMIT)
+    with pytest.raises(IntegrationError) as failure:
+        await adapters.locate_function(snapshot_ref, func)
+    assert failure.value.code == "function_not_found"
+    result = await adapters.search_code(snapshot_ref, func)
+    assert len(result.matches) == 1
+
+
+@pytest.mark.parametrize(
+    ("func", "source"),
+    [
+        (
+            "int f(void) {\n#define VALUE 1\nreturn VALUE;\n}",
+            "int f(void) {\r\n \t#define VALUE 1 \r\n \treturn VALUE;\r\n}",
+        ),
+        (
+            "int f(void) {\n#define VALUE \\\n1\nreturn VALUE;\n}",
+            "int f(void) {\r\n#define VALUE \\\r\n1 \r\n return VALUE;\r\n}",
+        ),
+        (
+            "int f(void) {\n#define VALUE /* note text */ 1\nreturn VALUE;\n}",
+            "int f(void) {\n#define VALUE /* note\n text */ 1\nreturn VALUE;\n}",
+        ),
+        (
+            "int f(void) {\n/* #define VALUE text */ return 1;\n}",
+            "int f(void) {\n/* #define VALUE\n text */ return 1;\n}",
+        ),
+        (
+            "#if 1\nint f(void) { return 1; }\n#endif",
+            "\ufeff#if 1\nint f(void) { return 1; }\n#endif",
+        ),
+    ],
+)
+async def test_directive_boundaries_keep_equivalent_layouts(tmp_path, func, source):
+    fake = FakeGit({REPO: {COMMIT: {"a.c": source.encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_snapshot(
+        SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+    )
+    assert prepared.func == func
+
+
+@pytest.mark.parametrize(
+    ("character", "cut"),
+    [("é", 1), ("界", 1), ("界", 2), ("😀", 1), ("😀", 2), ("😀", 3)],
+)
+@pytest.mark.parametrize("course", [False, True])
+async def test_extensionless_header_with_split_preview_remains_code(
+    tmp_path, character, cut, course
+):
+    func = "int preview_marker(void) { return 0; }"
+    prefix = "#ifndef HEADER\n#define HEADER\n/*"
+    prefix += "a" * (4096 - cut - len(prefix))
+    source = prefix + character + "*/\n" + func + "\n#endif\n"
+    fake = FakeGit({REPO: {COMMIT: {"header": source.encode("utf-8")}}})
+    adapters = build_adapters(tmp_path, fake)
+    if course:
+        prepared = await adapters.prepare_course(
+            CourseSample(idx=1, func=func, commit_url=COMMIT_URL, target=0)
+        )
+    else:
+        prepared = await adapters.prepare_snapshot(
+            SnapshotRequest(idx=1, func=func, commit_url=COMMIT_URL, revision="commit")
+        )
+    assert prepared.func == func
+    location = await adapters.locate_function(prepared.snapshot_ref, func)
+    assert location.path == "header"
+    assert location.start_line == location.end_line == 4
+    assert location.content == func
+    searched = await adapters.search_code(prepared.snapshot_ref, "return 0;")
+    assert searched.matches == [location]
+    symbols = await adapters.find_symbol(prepared.snapshot_ref, "preview_marker")
+    assert symbols.matches == [location]
+    assert "header:4 definition" in symbols.scope
