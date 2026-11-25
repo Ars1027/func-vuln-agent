@@ -927,3 +927,74 @@ async def test_extensionless_header_with_split_preview_remains_code(
     symbols = await adapters.find_symbol(prepared.snapshot_ref, "preview_marker")
     assert symbols.matches == [location]
     assert "header:4 definition" in symbols.scope
+
+
+def test_course_qemu_gitweb_url_uses_original_sha_and_respects_host_allowlist():
+    from app.repository.urls import parse_commit_url
+    from app.schemas.ports import IntegrationError
+
+    sha = "e6908bfe8e07f2b452e78e677da1b45b1c0f6829"
+    url = f"https://git.qemu.org/?p=qemu.git;a=commit;h={sha}"
+    target = parse_commit_url(url)
+    assert target.repo_url == "https://github.com/qemu/qemu.git"
+    assert target.commit == sha
+    with pytest.raises(IntegrationError):
+        parse_commit_url(url, ["example.org"])
+
+
+async def test_multiline_return_type_omitted_by_course_extractor_is_located(tmp_path):
+    body = "mrb_ary_shift_m(int state, int self)\n{\n  return self;\n}"
+    source = "static int\n" + body + "\n"
+    fake = FakeGit({REPO: {COMMIT: {"src/array.c": source}}})
+    adapters = build_adapters(tmp_path, fake)
+    prepared = await adapters.prepare_course(
+        CourseSample(idx=1, func=body, commit_url=COMMIT_URL, target=0)
+    )
+    location = await adapters.locate_function(prepared.snapshot_ref, body)
+    assert (location.path, location.start_line, location.end_line) == ("src/array.c", 2, 5)
+    assert location.content == body
+
+
+@pytest.mark.parametrize(
+    ("source_prefix", "sample_func", "expected_start"),
+    [
+        (
+            "template <typename Device, typename T>\n",
+            "void SparseFill(int* x) {\n  *x = 0;\n}",
+            1,
+        ),
+        (
+            "GF_EXPORT\n",
+            "int gf_parse_nalu(int x)\n{\n  return x;\n}",
+            1,
+        ),
+        (
+            "/* {{{ pop_element\n */\n",
+            " */\nstatic void pop_element(int x)\n{\n  (void)x;\n}",
+            3,
+        ),
+    ],
+)
+async def test_opt_in_course_extractor_omissions_locates_function(
+    tmp_path, source_prefix, sample_func, expected_start
+):
+    clean_body = sample_func.split("\n", 1)[1] if sample_func.startswith(" */") else sample_func
+    source = source_prefix + clean_body + "\n"
+    fake = FakeGit({REPO: {COMMIT: {"src/op.cc": source}}})
+    strict = build_adapters(tmp_path / "strict", fake)
+    with pytest.raises(IntegrationError):
+        await strict.prepare_course(
+            CourseSample(idx=1, func=sample_func, commit_url=COMMIT_URL, target=0)
+        )
+    compat = RepositoryAdapters(
+        tmp_path / "compat",
+        git=fake,
+        resolver=public_resolver,
+        allow_course_extractor_omissions=True,
+    )
+    prepared = await compat.prepare_course(
+        CourseSample(idx=1, func=sample_func, commit_url=COMMIT_URL, target=0)
+    )
+    location = await compat.locate_function(prepared.snapshot_ref, sample_func)
+    assert location.path == "src/op.cc"
+    assert location.start_line == expected_start

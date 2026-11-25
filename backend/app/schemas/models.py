@@ -186,7 +186,7 @@ class RunConfig(Contract):
     timeout_seconds: float = Field(default=120, gt=0)
     data_version: str | None = None
     index_version: str | None = None
-    prompt_version: str = "conditions-v2"
+    prompt_version: str = "conditions-v3"
 
 
 class Measurement(Contract):

@@ -13,6 +13,7 @@ import re
 import shutil
 import threading
 import uuid
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,6 +107,7 @@ class SnapshotStore:
         *,
         max_total_bytes: int | None = 2 * 1024**3,
         max_total_entries: int | None = 200_000,
+        cache_scan_snapshots: int = 0,
     ) -> None:
         self.root = Path(root)
         self.snapshots = self.root / "snapshots"
@@ -113,6 +115,11 @@ class SnapshotStore:
         self.temp = self.root / "tmp"
         self.max_total_bytes = max_total_bytes
         self.max_total_entries = max_total_entries
+        self.cache_scan_snapshots = cache_scan_snapshots
+        self._scan_cache: OrderedDict[
+            tuple[str, frozenset[str], int], tuple[tuple[FileEntry, ...], ScanReport]
+        ] = OrderedDict()
+        self._scan_cache_lock = threading.Lock()
         self._publish_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         # 引用没有到期/释放协议，已发布快照可能仍被排队或运行中的任务使用。
@@ -302,6 +309,12 @@ class SnapshotStore:
             raise IntegrationError("range_too_large", f"单次读取最多 {max_lines} 行，请缩小区间。")
         return lines, start_line + len(lines) - 1, len(lines) < end_line - start_line + 1
 
+    def evict_scan_cache(self, snapshot_ref: str) -> None:
+        with self._scan_cache_lock:
+            keys = [key for key in self._scan_cache if key[0] == snapshot_ref]
+            for key in keys:
+                self._scan_cache.pop(key, None)
+
     def iter_files(
         self,
         snapshot_ref: str,
@@ -314,6 +327,26 @@ class SnapshotStore:
         """遍历快照内的文本源码；跳过 `.git`，并把超限/非文本文件记入报告。"""
         check_scan_cancelled(cancel_event)
         root = self.snapshot_dir(snapshot_ref).resolve()
+        cache_key = (snapshot_ref, suffixes, max_bytes)
+        if self.cache_scan_snapshots > 0:
+            with self._scan_cache_lock:
+                cached = self._scan_cache.get(cache_key)
+                if cached is not None:
+                    self._scan_cache.move_to_end(cache_key)
+            if cached is not None:
+                cached_entries, cached_report = cached
+                if report is not None:
+                    report.scanned += cached_report.scanned
+                    report.oversized.extend(cached_report.oversized)
+                    report.binary.extend(cached_report.binary)
+                    report.excluded += cached_report.excluded
+                for idx, entry in enumerate(cached_entries):
+                    if idx % 256 == 0:
+                        check_scan_cancelled(cancel_event)
+                    yield entry
+                return
+        collected: list[FileEntry] | None = [] if self.cache_scan_snapshots > 0 else None
+        local_report = ScanReport() if collected is not None else None
         for directory, subdirectories, filenames in os.walk(root, onerror=_raise_read_error):
             check_scan_cancelled(cancel_event)
             subdirectories[:] = sorted(
@@ -336,22 +369,39 @@ class SnapshotStore:
                 if stat.st_size > max_bytes:
                     if report is not None:
                         report.oversized.append(relative)
+                    if local_report is not None:
+                        local_report.oversized.append(relative)
                     continue
                 suffix = path.suffix.lower()
                 if suffix not in suffixes and not (suffix == "" and _looks_like_source(path)):
                     if report is not None:
                         report.excluded += 1
+                    if local_report is not None:
+                        local_report.excluded += 1
                     continue
                 try:
                     text = self.read_text(path)
                 except _NonTextFile:
                     if report is not None:
                         report.binary.append(relative)
+                    if local_report is not None:
+                        local_report.binary.append(relative)
                     continue
                 if report is not None:
                     report.scanned += 1
+                if local_report is not None:
+                    local_report.scanned += 1
                 check_scan_cancelled(cancel_event)
-                yield FileEntry(path=relative, text=text, size=stat.st_size)
+                file_entry = FileEntry(path=relative, text=text, size=stat.st_size)
+                if collected is not None:
+                    collected.append(file_entry)
+                yield file_entry
+        if collected is not None and local_report is not None and self.cache_scan_snapshots > 0:
+            with self._scan_cache_lock:
+                self._scan_cache[cache_key] = (tuple(collected), local_report)
+                self._scan_cache.move_to_end(cache_key)
+                while len(self._scan_cache) > self.cache_scan_snapshots:
+                    self._scan_cache.popitem(last=False)
 
     def source_files(
         self, snapshot_ref: str, *, max_bytes: int = 2 * 1024 * 1024

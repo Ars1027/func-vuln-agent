@@ -23,12 +23,14 @@ class RepositoryTools:
         symbol_limit: int = 20,
         max_read_lines: int = 400,
         max_file_bytes: int = 2 * 1024 * 1024,
+        allow_course_extractor_omissions: bool = False,
     ) -> None:
         self.store = store
         self.search_limit = search_limit
         self.symbol_limit = symbol_limit
         self.max_read_lines = max_read_lines
         self.max_file_bytes = max_file_bytes
+        self.allow_course_extractor_omissions = allow_course_extractor_omissions
 
     async def locate_function(self, snapshot_ref: str, func: str) -> CodeLocation:
         return await run_cancellable(self._locate_function, snapshot_ref, func)
@@ -56,7 +58,13 @@ class RepositoryTools:
         cancel_event: threading.Event,
     ) -> CodeLocation:
         self.store.snapshot_dir(snapshot_ref)
-        return locate_function(self.store, snapshot_ref, func, cancel_event=cancel_event)
+        return locate_function(
+            self.store,
+            snapshot_ref,
+            func,
+            allow_course_extractor_omissions=self.allow_course_extractor_omissions,
+            cancel_event=cancel_event,
+        )
 
     def _search_code(
         self, snapshot_ref: str, query: str, *, cancel_event: threading.Event

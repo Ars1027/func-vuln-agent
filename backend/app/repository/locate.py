@@ -174,14 +174,121 @@ def _expand_lines(text: str, start: int, end: int) -> tuple[int, int, str]:
     return start_line, end_line, "\n".join(lines[start_line - 1 : end_line])
 
 
+def _extract_literal_anchors(needle: str) -> tuple[str, ...]:
+    """提取必须原样出现在源码中的字面片段，用于无损跳过无关文件。"""
+    identifier_runs = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", needle)
+    if any(mark in needle for mark in ('"', "'", "/*", "//", "\\")):
+        return (max(identifier_runs, key=len),) if identifier_runs else ()
+    parts = sorted({p for p in needle.split() if len(p) >= 2}, key=len, reverse=True)[:4]
+    if parts:
+        return tuple(parts)
+    return (max(identifier_runs, key=len),) if identifier_runs else ()
+
+
+def _may_contain_anchors(text: str, anchors: tuple[str, ...]) -> bool:
+    if not anchors:
+        return True
+    if "\\" not in text:
+        return all(anchor in text for anchor in anchors)
+    unwrapped = text.replace("\\\r\n", "").replace("\\\n", "")
+    return all(anchor in text or anchor in unwrapped for anchor in anchors)
+
+
+def _is_simple_return_prefix(text: str, declaration_start: int, code_start: int) -> bool:
+    """判断 declaration_start..code_start 是否仅为省去的多行/前置简单返回类型说明符。"""
+    if declaration_start >= code_start:
+        return False
+    has_specifier = False
+    for token in _DECLARATION_TOKENS.finditer(text, declaration_start):
+        if token.start() == code_start:
+            return has_specifier and token.group("code") is not None
+        if token.start() > code_start or token.end() > code_start:
+            return False
+        if token.group("comment") is not None or token.group("splice") is not None:
+            continue
+        if token.group("newline") is not None:
+            continue
+        value = token.group().replace("\\\r\n", "").replace("\\\n", "")
+        value = _ALTERNATIVE_PUNCTUATORS.get(value, value)
+        if value in {"{", "}", ";", "="}:
+            return False
+        if token.group("code") is not None:
+            has_specifier = True
+    return False
+
+
+def _is_course_declaration_prefix(text: str, declaration_start: int, code_start: int) -> bool:
+    """判断 declaration_start..code_start 是否为课程提取器省略的模板头或导出修饰符前缀。"""
+    if declaration_start >= code_start:
+        return False
+    has_specifier = False
+    angle_depth = paren_depth = bracket_depth = 0
+    for token in _DECLARATION_TOKENS.finditer(text, declaration_start):
+        if token.start() == code_start:
+            return (
+                has_specifier
+                and angle_depth == 0
+                and paren_depth == 0
+                and bracket_depth == 0
+                and token.group("code") is not None
+            )
+        if token.start() > code_start or token.end() > code_start:
+            return False
+        if token.group("comment") is not None or token.group("splice") is not None:
+            continue
+        if token.group("newline") is not None:
+            continue
+        value = token.group().replace("\\\r\n", "").replace("\\\n", "")
+        value = _ALTERNATIVE_PUNCTUATORS.get(value, value)
+        if angle_depth == 0 and paren_depth == 0 and bracket_depth == 0:
+            if value in {"{", "}", ";", "="}:
+                return False
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            if paren_depth <= 0:
+                return False
+            paren_depth -= 1
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            if bracket_depth <= 0:
+                return False
+            bracket_depth -= 1
+        elif paren_depth == 0 and bracket_depth == 0 and value == "<":
+            angle_depth += 1
+        elif paren_depth == 0 and bracket_depth == 0 and value == ">":
+            if angle_depth <= 0:
+                return False
+            angle_depth -= 1
+        if token.group("code") is not None:
+            has_specifier = True
+    return False
+
+
 def iter_matches(
     text: str,
     needle: str,
     *,
     code_offset: int | None = None,
+    allow_omitted_return_type: bool = False,
+    allow_course_prefix: bool = False,
     cancel_event: threading.Event | None = None,
 ) -> Iterator[tuple[int, int]]:
     """按原文偏移逐个产出匹配，避免为高频词一次性分配全部结果。"""
+    if code_offset is None and " " not in needle and "\n" not in needle:
+        pos = text.find(needle)
+        while pos != -1:
+            check_scan_cancelled(cancel_event)
+            yield pos, pos + len(needle)
+            pos = text.find(needle, pos + len(needle))
+        return
+    if (
+        code_offset is None
+        and "\\" not in text
+        and not re.search(r"\s+".join(re.escape(part) for part in needle.split()), text)
+    ):
+        return
     haystack, offsets = normalize_whitespace(
         text, preserve_logical_lines=code_offset is not None, cancel_event=cancel_event
     )
@@ -191,6 +298,7 @@ def iter_matches(
         else iter(())
     )
     declaration_start = next(starts, None)
+    last_declaration_start: int | None = None
     position = haystack.find(needle)
     while position != -1:
         check_scan_cancelled(cancel_event)
@@ -199,9 +307,26 @@ def iter_matches(
         valid_start = True
         if code_offset is not None:
             code_start = offsets[position + code_offset]
-            while declaration_start is not None and declaration_start < code_start:
+            while declaration_start is not None and declaration_start <= code_start:
+                last_declaration_start = declaration_start
                 declaration_start = next(starts, None)
-            valid_start = declaration_start == code_start
+            if last_declaration_start == code_start:
+                valid_start = True
+            elif (
+                allow_omitted_return_type
+                and last_declaration_start is not None
+                and _is_simple_return_prefix(text, last_declaration_start, code_start)
+            ):
+                valid_start = True
+            elif (
+                allow_course_prefix
+                and last_declaration_start is not None
+                and _is_course_declaration_prefix(text, last_declaration_start, code_start)
+            ):
+                valid_start = True
+                start = last_declaration_start
+            else:
+                valid_start = False
         if valid_start:
             yield start, end
         position = haystack.find(needle, position + len(needle))
@@ -315,15 +440,15 @@ def _first_code_offset(text: str) -> int | None:
     return None
 
 
-def locate_function(
+def _scan_function_locations(
     store: SnapshotStore,
     snapshot_ref: str,
     func: str,
     *,
-    report: ScanReport | None = None,
-    cancel_event: threading.Event | None = None,
-) -> CodeLocation:
-    """在快照中定位待测函数的相对路径与原始行号。"""
+    allow_course_prefix: bool,
+    scan: ScanReport,
+    cancel_event: threading.Event | None,
+) -> list[CodeLocation]:
     needle, offsets = normalize_whitespace(
         func, preserve_logical_lines=True, cancel_event=cancel_event
     )
@@ -331,14 +456,25 @@ def locate_function(
     if not needle or first_code is None:
         raise IntegrationError("function_not_found", "待测函数不包含代码，无法在快照中定位。")
     code_offset = bisect_left(offsets, first_code)
-    scan = report if report is not None else ScanReport()
+    allow_omitted_return = bool(
+        re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(", func[first_code:]) and "{" in func[first_code:]
+    )
+    allow_prefix = allow_course_prefix and "{" in func[first_code:]
+    anchors = _extract_literal_anchors(needle)
     found: list[CodeLocation] = []
     for entry in store.iter_files(
         snapshot_ref, max_bytes=MAX_SCAN_BYTES, report=scan, cancel_event=cancel_event
     ):
         check_scan_cancelled(cancel_event)
+        if not _may_contain_anchors(entry.text, anchors):
+            continue
         for start, end in iter_matches(
-            entry.text, needle, code_offset=code_offset, cancel_event=cancel_event
+            entry.text,
+            needle,
+            code_offset=code_offset,
+            allow_omitted_return_type=allow_omitted_return,
+            allow_course_prefix=allow_prefix,
+            cancel_event=cancel_event,
         ):
             start_line, end_line, content = _expand_lines(entry.text, start, end)
             found.append(
@@ -356,6 +492,41 @@ def locate_function(
                     "function_ambiguous",
                     f"待测函数在快照中出现多次（{locations}），无法确定唯一证据位置。",
                 )
+    return found
+
+
+def locate_function(
+    store: SnapshotStore,
+    snapshot_ref: str,
+    func: str,
+    *,
+    allow_course_extractor_omissions: bool = False,
+    report: ScanReport | None = None,
+    cancel_event: threading.Event | None = None,
+) -> CodeLocation:
+    """在快照中定位待测函数的相对路径与原始行号。"""
+    scan = report if report is not None else ScanReport()
+    found = _scan_function_locations(
+        store,
+        snapshot_ref,
+        func,
+        allow_course_prefix=False,
+        scan=scan,
+        cancel_event=cancel_event,
+    )
+    if not found and allow_course_extractor_omissions:
+        candidate_func = func
+        first_code = _first_code_offset(func)
+        if first_code is not None and func[first_code:].startswith("*/"):
+            candidate_func = func[first_code + 2 :]
+        found = _scan_function_locations(
+            store,
+            snapshot_ref,
+            candidate_func,
+            allow_course_prefix=True,
+            scan=ScanReport(),
+            cancel_event=cancel_event,
+        )
     check_scan_cancelled(cancel_event)
     if not found:
         detail = scan.note()
@@ -384,6 +555,7 @@ def search_code(
     needle, _ = normalize_whitespace(query, cancel_event=cancel_event)
     if not needle:
         raise IntegrationError("empty_query", "搜索内容不能为空。")
+    anchors = _extract_literal_anchors(needle)
     report = ScanReport()
     matches: list[CodeLocation] = []
     seen: set[tuple[str, int, int]] = set()
@@ -393,6 +565,9 @@ def search_code(
     for entry in store.iter_files(
         snapshot_ref, max_bytes=max_file_bytes, report=report, cancel_event=cancel_event
     ):
+        check_scan_cancelled(cancel_event)
+        if not _may_contain_anchors(entry.text, anchors):
+            continue
         line, cursor = 1, 0
         for start, end in iter_matches(entry.text, needle, cancel_event=cancel_event):
             if total >= match_budget:
@@ -482,6 +657,28 @@ def _symbol_contexts(
     text: str, matches: Iterator[re.Match], *, cancel_event: threading.Event | None = None
 ) -> Iterator[tuple[re.Match, bool, int]]:
     """按符号位置向前扫描一次，避免对每次出现重新扫描整个文件前缀。"""
+    match_list = list(matches)
+    if not match_list:
+        return
+    needs_scope = False
+    for item in match_list:
+        after = text[item.end() : item.end() + CLASSIFY_LOOKAHEAD]
+        if not re.match(r"\s*\(", after) and _mask_non_code(after).lstrip()[:1] in {
+            "=",
+            ";",
+            "[",
+            "{",
+            ",",
+        }:
+            needs_scope = True
+            break
+    if not needs_scope:
+        for _ in range(0, match_list[-1].start() + 1, 4096):
+            check_scan_cancelled(cancel_event)
+        for item in match_list:
+            check_scan_cancelled(cancel_event)
+            yield item, False, text.rfind("\n", 0, item.start()) + 1
+        return
     stack: list[bool] = []
     non_global = 0
     index = 0
@@ -489,7 +686,7 @@ def _symbol_contexts(
     lexemes = _LEXEMES.finditer(text)
     lexeme = next(lexemes, None)
     next_cancel_check = 0
-    for match in matches:
+    for match in match_list:
         check_scan_cancelled(cancel_event)
         while index < match.start():
             if cancel_event is not None and index >= next_cancel_check:
@@ -663,6 +860,8 @@ def find_symbol(
         if scanned_bytes > scan_byte_budget:
             scan_truncated = True
             break
+        if symbol not in entry.text or not pattern.search(entry.text):
+            continue
         line, cursor = 1, 0
         for match, global_scope, line_start in _symbol_contexts(
             entry.text, pattern.finditer(entry.text), cancel_event=cancel_event

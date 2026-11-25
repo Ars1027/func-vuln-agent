@@ -22,12 +22,14 @@ def load_config() -> RunConfig:
         timeout_seconds=float(os.getenv("FVA_TIMEOUT_SECONDS", "120")),
         data_version=os.getenv("FVA_DATA_VERSION"),
         index_version=os.getenv("FVA_INDEX_VERSION"),
+        prompt_version=os.getenv("FVA_PROMPT_VERSION", "conditions-v3"),
     )
 
 
 def configured_model(config: RunConfig):
-    if config.model == "unconfigured" or not os.getenv("OPENAI_API_KEY"):
-        raise IntegrationError("model_unconfigured", "请设置 FVA_MODEL 和 OPENAI_API_KEY。")
+    deepseek = config.model.startswith("deepseek-") and os.getenv("DEEPSEEK_API_KEY")
+    if config.model == "unconfigured" or not (deepseek or os.getenv("OPENAI_API_KEY")):
+        raise IntegrationError("model_unconfigured", "请设置 FVA_MODEL 和对应服务的 API 密钥。")
     return openai_model_factory(config)
 
 

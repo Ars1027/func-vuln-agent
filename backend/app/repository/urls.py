@@ -51,6 +51,13 @@ def parse_commit_url(
         raise IntegrationError("repository_host_not_configured", "未配置允许的代码托管主机。")
     if not isinstance(url, str) or not url.strip():
         raise IntegrationError("unsupported_commit_url", "提交链接为空。")
+    # Historical QEMU gitweb URLs in the course data name the same Git objects
+    # as the official GitHub mirror. Preserve the requested SHA and host allowlist.
+    legacy = re.fullmatch(
+        r"https://git\.qemu\.org/\?p=qemu\.git;a=commit;h=([0-9a-fA-F]{40})", url.strip()
+    )
+    if legacy:
+        url = f"https://github.com/qemu/qemu/commit/{legacy[1]}"
     try:
         parts = urlsplit(url.strip())
     except ValueError as exc:

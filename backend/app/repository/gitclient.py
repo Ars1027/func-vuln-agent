@@ -18,9 +18,10 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
+from app.repository.store import CODE_SUFFIXES
 from app.schemas.paths import normalize_snapshot_path
 from app.schemas.ports import IntegrationError
 
@@ -137,6 +138,8 @@ class SubprocessGitClient:
         max_total_bytes: int | None = 2 * 1024 * 1024 * 1024,
         min_idle_seconds: float = 600.0,
         allow_local_transport: bool = False,
+        allow_case_sensitive_export: bool = False,
+        skip_non_code_invalid_paths: bool = False,
     ) -> None:
         self.mirror_root = Path(mirror_root)
         self._executable = executable
@@ -150,6 +153,8 @@ class SubprocessGitClient:
         self._quota_lock = threading.Lock()
         # 仅测试用：允许 file:// 与本地路径（生产环境保持 False）。
         self.allow_local_transport = allow_local_transport
+        self.allow_case_sensitive_export = allow_case_sensitive_export
+        self.skip_non_code_invalid_paths = skip_non_code_invalid_paths
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._version: tuple[int, int] | None = None
@@ -584,6 +589,17 @@ class SubprocessGitClient:
         if len(entries) > self.max_files:
             raise IntegrationError("snapshot_too_large", "指定版本快照文件数超出上限。")
         destination.mkdir(parents=True, exist_ok=True)
+        if self.allow_case_sensitive_export and os.name == "nt":
+            completed = subprocess.run(
+                ["fsutil.exe", "file", "setCaseSensitiveInfo", str(destination), "enable"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise IntegrationError(
+                    "snapshot_export_failed", "当前文件系统无法启用大小写敏感快照目录。"
+                )
         root = destination.resolve()
         count = 0
         total = 0
@@ -595,11 +611,16 @@ class SubprocessGitClient:
             for sha, raw_path in entries:
                 if cancel_event is not None and cancel_event.is_set():
                     raise IntegrationError("repository_cancelled", "准备代码快照的操作已取消。")
-                relative = _relative_path(raw_path)
+                try:
+                    relative = _relative_path(raw_path)
+                except IntegrationError:
+                    if self.skip_non_code_invalid_paths and _is_skippable_non_code_path(raw_path):
+                        continue
+                    raise
                 parts = relative.split("/")
                 for length in range(1, len(parts) + 1):
                     prefix = "/".join(parts[:length])
-                    canonical = prefix.casefold()
+                    canonical = prefix if self.allow_case_sensitive_export else prefix.casefold()
                     if canonical in paths and paths[canonical] != prefix:
                         raise IntegrationError(
                             "snapshot_export_failed", "提交包含跨平台冲突的路径。"
@@ -751,6 +772,18 @@ def _relative_path(raw: bytes) -> str:
         return normalize_snapshot_path(path)
     except ValueError as exc:
         raise IntegrationError("snapshot_export_failed", "提交包含跨平台歧义的路径。") from exc
+
+
+def _is_skippable_non_code_path(raw: bytes) -> bool:
+    """仅当非 C/C++ 资源文件含跨平台歧义路径且不含目录越界时允许跳过。"""
+    if b"\x00" in raw or raw.startswith(b"/"):
+        return False
+    decoded = raw.decode("utf-8", errors="replace")
+    parts = [p for p in decoded.replace("\\", "/").split("/") if p]
+    if not parts or any(p in {".", ".."} or p.casefold() == ".git" for p in parts):
+        return False
+    suffix = PurePosixPath(parts[-1]).suffix.lower()
+    return bool(suffix) and suffix not in CODE_SUFFIXES
 
 
 def _directory_size(path: Path) -> int:

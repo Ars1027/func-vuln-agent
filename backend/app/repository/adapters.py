@@ -32,6 +32,7 @@ class RepositoryAdapters:
         max_read_lines: int = 400,
         max_file_bytes: int = 2 * 1024 * 1024,
         max_storage_bytes: int | None = 2 * 1024**3,
+        allow_course_extractor_omissions: bool = False,
     ) -> None:
         self.store = SnapshotStore(storage_dir, max_total_bytes=max_storage_bytes)
         # 进程启动时回收上次中断遗留的暂存目录。
@@ -45,6 +46,7 @@ class RepositoryAdapters:
             symbol_limit=symbol_limit,
             max_read_lines=max_read_lines,
             max_file_bytes=max_file_bytes,
+            allow_course_extractor_omissions=allow_course_extractor_omissions,
         )
         self.preparation = RepositoryPreparation(
             self.store,

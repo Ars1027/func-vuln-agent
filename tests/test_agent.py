@@ -483,3 +483,129 @@ async def test_unexpected_tool_error_logs_location_without_secret_text(caplog):
     assert "'idx': 1" in caplog.text
     assert "sk_private" not in caplog.text
     assert "private source code" not in caplog.text
+
+
+async def test_mimo_retries_invalid_final_arguments_within_budget():
+    report, measurement, *_ = await run_script(
+        [
+            call("finish", {"piction": "1", "reason": "fixture"}),
+            call("finish", {"prediction": 1, "reason": "fixture"}),
+        ],
+        mode="function_only",
+        config=RunConfig(model="mimo-fixture", max_model_calls=2),
+    )
+    assert report.prediction == 1
+    assert measurement.model_calls == 2
+
+
+async def test_mimo_recovers_plain_text_multi_tool_and_recoverable_tool_errors():
+    class InvalidSymbolRepo(FakeRepository):
+        async def find_symbol(self, snapshot_ref, symbol):
+            if "." in symbol:
+                raise IntegrationError("invalid_symbol", "Identifier required.")
+            return await super().find_symbol(snapshot_ref, symbol)
+
+    multi = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "search_code", "args": {"query": "a"}, "id": "c1"},
+            {"name": "finish", "args": {"prediction": 0, "reason": "r"}, "id": "c2"},
+        ],
+    )
+    report, measurement, _, _, _, model = await run_script(
+        [
+            AIMessage(content='{"prediction": 0, "reason": "plain text"}'),
+            multi,
+            call("find_symbol", {"symbol": "cl.lockfile"}),
+            call("find_symbol", {"symbol": "remaining"}),
+            call("finish", {"prediction": 0, "reason": "checked after recovery"}),
+        ],
+        mode="rag_context",
+        repo=InvalidSymbolRepo(),
+        config=RunConfig(model="mimo-fixture", max_model_calls=6),
+    )
+    assert report.prediction == 0
+    assert measurement.model_calls == 5
+    tool_msgs = [m.content for turn in model.seen for m in turn if isinstance(m, ToolMessage)]
+    assert any("remaining_model_calls" in str(text) for text in tool_msgs)
+    assert any("invalid_symbol" in str(text) for text in tool_msgs)
+
+
+async def test_conditions_v3_rechecks_contradictory_finish_at_most_once():
+    # 1. All-refuted conditions + prediction=1 triggers one verification turn, then reconciles to 0
+    report, measurement, *_ = await run_script(
+        [
+            update("refuted", ["e1"], "bounds check covers dst copy on this path"),
+            call("finish", {"prediction": 1, "reason": "claims bug despite e1"}),
+            call("finish", {"prediction": 0, "reason": "h1 refuted by covering check in e1"}),
+        ],
+        mode="conditions",
+        config=RunConfig(model="deepseek-fixture", max_model_calls=5),
+    )
+    assert report.prediction == 0
+    assert measurement.model_calls == 3
+
+    # 2. Fully-supported hypothesis + prediction=0 triggers at most one recheck; 2nd finish accepted
+    report2, measurement2, *_ = await run_script(
+        [
+            update("supported", ["e1"], "copy length exceeds capacity in e1"),
+            call("finish", {"prediction": 0, "reason": "safe despite e1"}),
+            call("finish", {"prediction": 0, "reason": "still insists 0 citing e1"}),
+        ],
+        mode="conditions",
+        config=RunConfig(model="deepseek-fixture", max_model_calls=5),
+    )
+    assert report2.prediction == 0
+    assert measurement2.model_calls == 3
+
+
+async def test_conditions_v4_cost_caches_duplicate_calls_and_emits_convergence_hint():
+    repo = FakeRepository()
+    retriever = FakeRetriever()
+    report, measurement, _, _, _, model = await run_script(
+        [
+            call("search_cases", {"query": "copy bounds", "limit": 3}),
+            call("search_cases", {"query": "copy bounds", "limit": 3}),
+            call("read_file", {"path": "src/copy.c", "start_line": 10, "end_line": 10}),
+            call("search_code", {"query": "remaining"}),
+            call("search_code", {"query": "remaining"}),
+            update("supported", ["e1", "e3"], "destination bound missing on copy path"),
+            call("finish", {"prediction": 1, "reason": "supported by e1 and e3"}),
+        ],
+        mode="conditions",
+        repo=repo,
+        retriever=retriever,
+        config=RunConfig(model="deepseek-fixture", prompt_version="conditions-v4-cost"),
+    )
+    assert report.prediction == 1
+    assert measurement.model_calls == 7
+    # Duplicate queries and contained e1 read_file avoided adapter calls
+    assert len(retriever.calls) == 1
+    assert [c[0] for c in repo.calls] == ["locate", "search"]
+    init_target = json.loads(model.seen[0][2].content)["target_function"]
+    assert init_target["same_as_source_code"] is True
+    assert "content" not in init_target
+    tool_payloads = [json.loads(m.content) for m in model.seen[-1] if isinstance(m, ToolMessage)]
+    assert any(p.get("cached") is True for p in tool_payloads)
+    assert any("convergence_hint" in p for p in tool_payloads)
+
+    # Pure lossless caching mode deduplicates payloads without emitting early-stop convergence hints
+    repo2 = FakeRepository()
+    retriever2 = FakeRetriever()
+    report_c, _, _, _, _, model_c = await run_script(
+        [
+            call("search_cases", {"query": "copy bounds", "limit": 3}),
+            call("search_cases", {"query": "copy bounds", "limit": 3}),
+            update("supported", ["e1"], "destination bound missing on copy path"),
+            call("finish", {"prediction": 1, "reason": "supported by e1"}),
+        ],
+        mode="conditions",
+        repo=repo2,
+        retriever=retriever2,
+        config=RunConfig(model="deepseek-fixture", prompt_version="conditions-v3-cache"),
+    )
+    assert report_c.prediction == 1
+    assert len(retriever2.calls) == 1
+    payloads_c = [json.loads(m.content) for m in model_c.seen[-1] if isinstance(m, ToolMessage)]
+    assert any(p.get("cached") is True for p in payloads_c)
+    assert not any("convergence_hint" in p for p in payloads_c)
