@@ -16,6 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import ValidationError
 
+from app.api import discussion
 from app.diagnostics import log_failure
 from app.schemas.models import (
     ActiveSample,
@@ -635,6 +636,20 @@ def create_app(
             "task_id": task_id,
             "measurements": [m.model_dump(mode="json") for m in store.measurements(task_id)],
         }
+
+    @app.post("/api/tasks/{task_id}/discussion")
+    async def discuss_report(task_id: str, request: discussion.Question):
+        reports = store.reports(task_id).reports
+        report = next((item for item in reports if item.idx == request.idx), None)
+        if report is None:
+            raise ApiError(404, "report_missing", "该样本尚无完成的报告。")
+        try:
+            return {"answer": await discussion.answer(report, request)}
+        except Exception as exc:
+            log_failure(logger, "report_discussion", exc, task_id=task_id)
+            raise ApiError(
+                503, "discussion_unavailable", "报告问答暂不可用，请检查模型配置。"
+            ) from exc
 
     @app.get("/api/tasks/{task_id}/result.jsonl")
     async def export_result(task_id: str) -> PlainTextResponse:

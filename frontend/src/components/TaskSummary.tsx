@@ -1,10 +1,13 @@
-import { MODE_LABELS } from "../api/types";
+import { Activity, Check, Copy, Download, Gauge, RefreshCw } from "lucide-react";
+
+import { MODE_LABELS, type Measurement } from "../api/types";
 import { useChangeFlash } from "../hooks/useChangeFlash";
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useElapsed } from "../hooks/useElapsed";
 import type { DisplayError } from "../lib/errors";
 import { taskProgress, type TaskState } from "../state/store";
 import { ErrorNotice } from "./ErrorNotice";
+import { TelemetryDrawer } from "./TelemetryDrawer";
 import { TaskStatusChip } from "./chips";
 import { ElapsedTime } from "./ui/ElapsedTime";
 import { ProgressBar } from "./ui/ProgressBar";
@@ -28,6 +31,12 @@ interface Props {
   onReload: () => void;
   onDownload: () => void;
   onClearDownloadError: () => void;
+  telemetryOpen?: boolean;
+  measurements?: Measurement[] | null;
+  measurementsLoading?: boolean;
+  measurementsError?: DisplayError | null;
+  onToggleTelemetry?: () => void;
+  onRefreshTelemetry?: () => void;
 }
 
 export function TaskSummary({
@@ -39,6 +48,12 @@ export function TaskSummary({
   onReload,
   onDownload,
   onClearDownloadError,
+  telemetryOpen = false,
+  measurements = null,
+  measurementsLoading = false,
+  measurementsError = null,
+  onToggleTelemetry,
+  onRefreshTelemetry,
 }: Props) {
   const progress = taskProgress(state);
   const downloadDisabled = state.taskId === null;
@@ -57,7 +72,12 @@ export function TaskSummary({
     <div className="task-summary">
       <div className="task-summary__head">
         <div className="task-summary__ident">
-          <h2 className="panel__title">任务进度</h2>
+          <h2 className="panel__title">
+            <span className="panel__title-icon" aria-hidden="true">
+              <Activity size={14} />
+            </span>
+            任务进度
+          </h2>
           <p className="task-summary__id" title={taskId ?? ""}>
             <span className="muted">task_id</span>{" "}
             <code>{taskId === null ? "—" : taskId}</code>
@@ -67,13 +87,37 @@ export function TaskSummary({
                 className={`copy-button ${copyState === "copied" ? "is-done" : ""}`}
                 onClick={() => void copy(taskId)}
               >
+                {copyState === "copied" ? (
+                  <Check size={11} aria-hidden="true" />
+                ) : (
+                  <Copy size={11} aria-hidden="true" />
+                )}
                 {COPY_LABELS[copyState]}
               </button>
             )}
           </p>
         </div>
+
         <div className="task-summary__actions">
-          <button type="button" className="button" onClick={onReload} disabled={loading || downloadDisabled}>
+          {onToggleTelemetry !== undefined && (
+            <button
+              type="button"
+              className={`button ${telemetryOpen ? "border-accent text-accent" : ""}`}
+              onClick={onToggleTelemetry}
+              disabled={downloadDisabled}
+              aria-expanded={telemetryOpen}
+            >
+              <Gauge size={14} aria-hidden="true" />
+              实验测量
+            </button>
+          )}
+          <button
+            type="button"
+            className="button"
+            onClick={onReload}
+            disabled={loading || downloadDisabled}
+          >
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} aria-hidden="true" />
             {loading ? "加载中…" : "刷新快照并续接"}
           </button>
           <button
@@ -82,6 +126,7 @@ export function TaskSummary({
             onClick={onDownload}
             disabled={downloadDisabled}
           >
+            <Download size={14} aria-hidden="true" />
             下载 result.jsonl
           </button>
         </div>
@@ -127,14 +172,23 @@ export function TaskSummary({
         <div>
           <dt>事件流</dt>
           <dd>
-            {CONNECTION_LABELS[state.connection]}
+            <span>{CONNECTION_LABELS[state.connection]}</span>
             <span className="muted"> · seq {state.seq}</span>
           </dd>
         </div>
       </dl>
 
+      {telemetryOpen && onRefreshTelemetry !== undefined && (
+        <TelemetryDrawer
+          measurements={measurements}
+          loading={measurementsLoading}
+          error={measurementsError}
+          onRefresh={onRefreshTelemetry}
+        />
+      )}
+
       {state.status !== "completed" && taskId !== null && (
-        <p className="field__hint">
+        <p className="field__hint mt-3">
           导出只接受全部样本成功且标识唯一的任务；含失败项或仍在运行时点击下载会返回原因。
         </p>
       )}

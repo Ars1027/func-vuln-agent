@@ -1,4 +1,5 @@
-import type { CSSProperties } from "react";
+import { BookOpen, Compass, Crosshair, FileCode, History, Search } from "lucide-react";
+import type { CSSProperties, ReactNode } from "react";
 
 import type { TraceEntry } from "../api/types";
 import { useFollowLatest } from "../hooks/useFollowLatest";
@@ -15,6 +16,14 @@ const TOOL_LABELS: Record<string, string> = {
   read_file: "读取文件",
   find_symbol: "查找符号",
   locate_function: "定位目标函数",
+};
+
+const TOOL_ICONS: Record<string, ReactNode> = {
+  search_cases: <BookOpen size={13} aria-hidden="true" />,
+  search_code: <Search size={13} aria-hidden="true" />,
+  read_file: <FileCode size={13} aria-hidden="true" />,
+  find_symbol: <Compass size={13} aria-hidden="true" />,
+  locate_function: <Crosshair size={13} aria-hidden="true" />,
 };
 
 function formatArguments(arguments_: Record<string, unknown>): string {
@@ -35,7 +44,10 @@ export function TraceList({ trace, selectedEvidenceId, onSelectEvidence }: Props
   if (trace.length === 0) {
     return (
       <div className="section">
-        <h3 className="section-title">分析记录</h3>
+        <h3 className="section-title">
+          <History size={14} aria-hidden="true" />
+          分析记录
+        </h3>
         <p className="field__hint">尚无检索或仓库读取记录。</p>
       </div>
     );
@@ -44,6 +56,7 @@ export function TraceList({ trace, selectedEvidenceId, onSelectEvidence }: Props
   return (
     <div className="section">
       <h3 className="section-title">
+        <History size={14} aria-hidden="true" />
         分析记录
         <span className="muted"> {trace.length}</span>
         {!following && <span className="follow-tag">已暂停自动跟随</span>}
@@ -57,7 +70,10 @@ export function TraceList({ trace, selectedEvidenceId, onSelectEvidence }: Props
           >
             <div className="trace__head">
               <span className="trace__index">{index + 1}</span>
-              <span className="trace__tool">{TOOL_LABELS[entry.tool] ?? entry.tool}</span>
+              <span className="inline-flex items-center gap-1.5 trace__tool">
+                {TOOL_ICONS[entry.tool]}
+                {TOOL_LABELS[entry.tool] ?? entry.tool}
+              </span>
               <code className="trace__tool-name mono">{entry.tool}</code>
             </div>
             <p className="trace__arguments mono">{formatArguments(entry.arguments)}</p>

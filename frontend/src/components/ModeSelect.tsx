@@ -27,7 +27,10 @@ export function ModeSelect({ mode, onChange, disabled }: Props) {
               checked={mode === item}
               onChange={() => onChange(item)}
             />
-            <span className="mode-option__name">{MODE_LABELS[item]}</span>
+            <span className="mode-option__name">
+              <span>{MODE_LABELS[item]}</span>
+              <code className="text-[11px]">{item}</code>
+            </span>
             <span className="mode-option__hint">{MODE_HINTS[item]}</span>
           </label>
         ))}

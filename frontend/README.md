@@ -38,6 +38,7 @@ npm run build          # 产物在 frontend/dist/
 | 任务状态、完成计数、失败项 | `GET /api/tasks/{task_id}` |
 | 报告快照（含运行中与失败样本） | `GET /api/tasks/{task_id}/reports` |
 | 实时过程事件 | `GET /api/tasks/{task_id}/events?after_seq={seq}`（SSE） |
+| 实验配置与运行测量 | `GET /api/tasks/{task_id}/measurements`（按需展开读取） |
 | 下载课程结果 | `GET /api/tasks/{task_id}/result.jsonl` |
 
 `mode`（`function_only` / `rag_context` / `conditions`）由界面选择，作为运行配置提交，不进入样本内容。
@@ -70,19 +71,24 @@ frontend/
 │   ├── api/           # client.ts（HTTP）、sse.ts（事件订阅）、types.ts（共享类型）
 │   ├── state/         # idx.ts（样本标识等价键）、store.ts（归约器与选择器）
 │   ├── hooks/         # useTaskStream（快照 + SSE 生命周期）、useElapsed（运行计时）、
-│   │                  # useChangeFlash（变化提示）、useCopyToClipboard、useFollowLatest
-│   ├── components/    # 业务组件：输入、任务进度、样本列表、假设/条件、证据、分析记录
+│   │                  # useChangeFlash（变化提示）、useCopyToClipboard、useFollowLatest、useTheme
+│   ├── components/    # 业务组件：可折叠输入栏、任务进度与测量抽屉、样本筛选侧栏、双栏同步检视器
 │   │   └── ui/        # 通用展示件：ProgressBar、Skeleton、EmptyState、ElapsedTime、ConditionBreakdown
-│   ├── lib/           # errors.ts（错误映射）、conditions.ts（条件计数）、demoSamples.ts
-│   └── styles.css     # 设计变量、组件样式、关键帧动效与响应式断点
+│   ├── lib/           # errors.ts、conditions.ts、demoSamples.ts、highlightCpp.tsx（C/C++ 词法着色）
+│   └── styles.css     # Tailwind 层 + 亮/暗双主题设计变量、关键帧动效与响应式断点
 └── vite.config.ts     # /api 代理与 vitest 配置
 ```
 
-`styles.css` 顶部的 `:root` 是唯一的设计变量来源（底面、边框、语义色、圆角、阴影）。
+`styles.css` 顶部的 `:root` 与 `[data-theme="dark"]` 是唯一的设计变量来源（底面、边框、语义色、代码着色、圆角、阴影），配合 Tailwind CSS 与 `lucide-react` 构建界面。
 语义色只用于三处：条件状态（有支持证据 / 有反证 / 待确认）、执行失败、判定结论；
 新增组件请复用这些变量，不要写死色值。
 
 ## 交互与视觉约定
+
+**审计工作台布局与主题**
+- 顶栏支持**亮色 / 深色双主题切换**（持久化至 `localStorage` 并跟随系统偏好）以及**宽屏审计模式**（一键收起左侧输入栏，释放全宽报告区）。
+- 大屏样本详情采用**双栏同步检视器**：左侧展示「漏洞假设与成立条件」，右侧吸附并联动展示「带真实源码行号（`start_line`–`end_line`）与 C/C++ 词法着色的证据检视器 + 分析时间线」。
+- 批量任务提供按 `idx` 搜索与按状态/判定结论（全部 / 有漏洞 / 无漏洞 / 分析中 / 失败）快速过滤；任务概览支持按需展开 `/measurements` 实验测量面板（模型轮次、工具次数、Token 用量与 `RunConfig`，未返回的用量明确标注缺失而非计作 `0`）。
 
 **实时反馈**（数据从 SSE 流式到达，界面要让“正在推进”可见）
 - 任务概览：完成/失败/分析中分段进度条 + 运行计时（结束后冻结为“耗时”），
@@ -109,7 +115,7 @@ frontend/
 
 ```sh
 npm run typecheck   # tsc --noEmit
-npm run test        # 9 个测试文件 / 69 个用例
+npm run test        # 10 个测试文件 / 72 个用例
 npm run build       # dist/ 构建产物
 ```
 

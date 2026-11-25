@@ -130,8 +130,18 @@ export function useTaskStream(): TaskStreamController {
     [clearStarted, detach, markStarted],
   );
 
+  useEffect(() => {
+    const taskId = new URLSearchParams(window.location.search).get("task");
+    if (taskId && /^[a-f0-9]{32}$/.test(taskId)) {
+      void connect(taskId);
+    }
+  }, [connect]);
+
   const startTask = useCallback(
     (view: TaskView) => {
+      const params = new URLSearchParams(window.location.search);
+      params.set("task", view.task_id);
+      window.history.replaceState(null, "", `?${params}${window.location.hash}`);
       void connect(view.task_id, { accepted: view });
     },
     [connect],

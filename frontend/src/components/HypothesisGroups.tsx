@@ -1,3 +1,5 @@
+import { GitBranch, Link2 } from "lucide-react";
+
 import type { Condition, Mode } from "../api/types";
 import { useChangeFlash } from "../hooks/useChangeFlash";
 import { conditionsByHypothesis, type SampleState } from "../state/store";
@@ -29,18 +31,27 @@ function ConditionRow({ condition, selectedEvidenceId, onSelectEvidence }: Condi
       <p className="condition__statement">{condition.statement}</p>
       <p className="condition__reason">{condition.reason}</p>
       <div className="chip-row">
-        {condition.evidence_ids.length === 0 && <span className="muted">未引用证据</span>}
-        {condition.evidence_ids.map((id) => (
-          <button
-            key={id}
-            type="button"
-            className={`evidence-chip ${id === selectedEvidenceId ? "is-active" : ""}`}
-            onClick={() => onSelectEvidence(id)}
-            title="在证据列表中查看来源"
-          >
-            {id}
-          </button>
-        ))}
+        {condition.evidence_ids.length === 0 ? (
+          <span className="muted">未引用证据</span>
+        ) : (
+          <>
+            <span className="inline-flex items-center gap-1 muted">
+              <Link2 size={11} aria-hidden="true" />
+              证据定位
+            </span>
+            {condition.evidence_ids.map((id) => (
+              <button
+                key={id}
+                type="button"
+                className={`evidence-chip ${id === selectedEvidenceId ? "is-active" : ""}`}
+                onClick={() => onSelectEvidence(id)}
+                title="在右侧证据检视器中定位并展开原文"
+              >
+                {id}
+              </button>
+            ))}
+          </>
+        )}
       </div>
     </li>
   );
@@ -55,8 +66,11 @@ export function HypothesisGroups({ sample, mode, selectedEvidenceId, onSelectEvi
   const hasConditions = sample.analysis.conditions.length > 0;
 
   return (
-    <div className="section">
-      <h3 className="section-title">漏洞假设与成立条件</h3>
+    <div className="section section--flush">
+      <h3 className="section-title">
+        <GitBranch size={14} aria-hidden="true" />
+        漏洞假设与成立条件
+      </h3>
 
       {!hasConditions && (
         <p className="field__hint">
@@ -74,7 +88,7 @@ export function HypothesisGroups({ sample, mode, selectedEvidenceId, onSelectEvi
           </header>
 
           {group.conditions.length === 0 ? (
-            <p className="field__hint">该假设暂无可展示条件。</p>
+            <p className="field__hint mt-2">该假设暂无可展示条件。</p>
           ) : (
             <ul className="condition-list">
               {group.conditions.map((condition) => (
@@ -91,8 +105,9 @@ export function HypothesisGroups({ sample, mode, selectedEvidenceId, onSelectEvi
       ))}
 
       {hasConditions && (
-        <p className="field__hint">
-          一个条件被反驳只否定对应假设的成立条件，不代表整个函数安全；<code>unknown</code> 也不等于无漏洞。
+        <p className="field__hint mt-3">
+          一个条件被反驳只否定对应假设的成立条件，不代表整个函数安全；<code>unknown</code>{" "}
+          也不等于无漏洞。
         </p>
       )}
     </div>

@@ -1,6 +1,7 @@
+import { Clock, Cpu, Scale, Wrench } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import type { Mode } from "../api/types";
+import type { Measurement, Mode } from "../api/types";
 import { idxKey } from "../state/idx";
 import type { SampleState } from "../state/store";
 import { ErrorNotice } from "./ErrorNotice";
@@ -13,9 +14,10 @@ import { ConditionBreakdown } from "./ui/ConditionBreakdown";
 interface Props {
   sample: SampleState;
   mode: Mode | null;
+  measurement?: Measurement;
 }
 
-export function SampleDetail({ sample, mode }: Props) {
+export function SampleDetail({ sample, mode, measurement }: Props) {
   const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | null>(null);
   const sampleKey = idxKey(sample.idx);
 
@@ -32,19 +34,42 @@ export function SampleDetail({ sample, mode }: Props) {
   const selectEvidence = (id: string) => setSelectedEvidenceId(id);
 
   return (
-    // key 随样本变化，切换样本时重放入场动画。
     <div className="sample-detail" key={sampleKey}>
       <header className="sample-detail__head">
-        <IdxBadge idx={sample.idx} />
-        <SampleStatusChip status={sample.status} />
-        <PredictionChip prediction={sample.prediction} />
+        <div className="sample-detail__badges">
+          <IdxBadge idx={sample.idx} />
+          <SampleStatusChip status={sample.status} />
+          <PredictionChip prediction={sample.prediction} />
+        </div>
+
+        {measurement !== undefined && (
+          <div className="sample-detail__metrics" title="该样本的实验测量记录">
+            <span className="metric-pill">
+              <Cpu size={11} aria-hidden="true" />
+              {measurement.model_calls ?? "—"} 轮模型
+            </span>
+            <span className="metric-pill">
+              <Wrench size={11} aria-hidden="true" />
+              {measurement.tool_calls ?? "—"} 次工具
+            </span>
+            {measurement.elapsed_seconds !== null && (
+              <span className="metric-pill">
+                <Clock size={11} aria-hidden="true" />
+                {measurement.elapsed_seconds.toFixed(2)}s
+              </span>
+            )}
+          </div>
+        )}
       </header>
 
       <ConditionBreakdown conditions={sample.analysis.conditions} />
 
       {sample.status === "completed" && (
         <div className={`verdict verdict--${sample.prediction}`}>
-          <h3 className="section-title">判定理由</h3>
+          <h3 className="section-title">
+            <Scale size={14} aria-hidden="true" />
+            判定理由
+          </h3>
           <p className="verdict__reason">{sample.reason}</p>
         </div>
       )}
@@ -56,7 +81,7 @@ export function SampleDetail({ sample, mode }: Props) {
             code={sample.failure?.code ?? "unknown_error"}
             message={sample.failure?.message ?? "分析未完成。"}
           />
-          <p className="field__hint">
+          <p className="field__hint mt-2">
             失败不补成 <code>prediction=0</code>；下方保留失败前已到达的分析状态。
           </p>
         </div>
@@ -68,25 +93,30 @@ export function SampleDetail({ sample, mode }: Props) {
         </p>
       )}
 
-      <HypothesisGroups
-        sample={sample}
-        mode={mode}
-        selectedEvidenceId={selectedEvidenceId}
-        onSelectEvidence={selectEvidence}
-      />
+      <div className="inspector-split">
+        <div className="inspector-pane">
+          <HypothesisGroups
+            sample={sample}
+            mode={mode}
+            selectedEvidenceId={selectedEvidenceId}
+            onSelectEvidence={selectEvidence}
+          />
+        </div>
 
-      <EvidenceList
-        evidence={sample.analysis.evidence}
-        referencedIds={referencedIds}
-        selectedId={selectedEvidenceId}
-        onSelect={selectEvidence}
-      />
-
-      <TraceList
-        trace={sample.analysis.trace}
-        selectedEvidenceId={selectedEvidenceId}
-        onSelectEvidence={selectEvidence}
-      />
+        <div className="inspector-pane inspector-pane--sticky">
+          <EvidenceList
+            evidence={sample.analysis.evidence}
+            referencedIds={referencedIds}
+            selectedId={selectedEvidenceId}
+            onSelect={selectEvidence}
+          />
+          <TraceList
+            trace={sample.analysis.trace}
+            selectedEvidenceId={selectedEvidenceId}
+            onSelectEvidence={selectEvidence}
+          />
+        </div>
+      </div>
     </div>
   );
 }

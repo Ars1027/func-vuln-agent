@@ -165,3 +165,12 @@ export async function fetchResult(taskId: string): Promise<string> {
   }
   return response.text();
 }
+type DiscussionMessage = {role: "user" | "assistant"; content: string};
+
+export function askAboutReport(taskId: string, idx: number | string, question: string, history: DiscussionMessage[]) {
+  return requestJson<{answer: string}>(`/api/tasks/${encodeURIComponent(taskId)}/discussion`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({idx, question, history}),
+  });
+}

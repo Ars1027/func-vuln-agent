@@ -821,3 +821,27 @@ def test_batch_limits_reject_before_parsing_and_preparation(tmp_path):
 def test_batch_limits_must_be_positive(tmp_path, option, value):
     with pytest.raises(ValueError, match="batch limits"):
         app_for(tmp_path / "tasks.db", **{option: value})
+
+
+def test_discussion_uses_selected_completed_report(tmp_path, monkeypatch):
+    async def respond(report, request):
+        assert report.idx == 5
+        assert request.history[0].content == "previous question"
+        return "See e1."
+
+    monkeypatch.setattr("app.api.discussion.answer", respond)
+    app, _, _ = app_for(tmp_path / "tasks.db")
+    with TestClient(app) as client:
+        result = client.post(
+            "/api/detections", json={"idx": 5, "func": "fixture", "snapshot_ref": "s"}
+        )
+        task_id = result.json()["task_id"]
+        wait_status(client, task_id, "completed")
+        url = f"/api/tasks/{task_id}/discussion"
+        data = {
+            "idx": 5,
+            "question": "Which evidence?",
+            "history": [{"role": "user", "content": "previous question"}],
+        }
+        assert client.post(url, json=data).json() == {"answer": "See e1."}
+        assert client.post(url, json={**data, "idx": "5"}).status_code == 404

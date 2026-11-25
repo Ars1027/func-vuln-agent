@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { CheckCircle2, FlaskConical, GitCommitHorizontal, Play, ShieldCheck } from "lucide-react";
+import { useMemo, useState } from "react";
 
 import { createDetection, createSnapshot } from "../api/client";
 import type { DetectionInput, Mode, TaskView } from "../api/types";
-import { describeError } from "../lib/errors";
 import { DEMO_SNAPSHOTS } from "../lib/demoSamples";
+import { describeError } from "../lib/errors";
 import { IdxInputError, parseIdxInput, type IdxInputKind } from "../state/idx";
 import { ErrorNotice } from "./ErrorNotice";
 
@@ -28,6 +29,11 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
   const [prepared, setPrepared] = useState<DetectionInput | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
+
+  const lineNumbers = useMemo(() => {
+    const count = Math.max(5, func.split("\n").length);
+    return Array.from({ length: Math.min(count, 120) }, (_, i) => i + 1);
+  }, [func]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -121,18 +127,34 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
       </div>
 
       <label className="field">
-        <span className="field__label">待测函数（C/C++）</span>
-        <textarea
-          className="code-input"
-          rows={5}
-          value={func}
-          onChange={(event) => setFunc(event.target.value)}
-          placeholder="void copy(char *dst, const char *src, size_t n) { memcpy(dst, src, n); }"
-        />
+        <span className="field__label justify-between">
+          <span>待测函数（C/C++）</span>
+          <span className="mono text-[11px] font-normal muted">
+            {func ? `${func.split("\n").length} 行` : "C / C++ 源码"}
+          </span>
+        </span>
+        <span className="code-editor-shell">
+          <span className="code-editor-shell__gutter" aria-hidden="true">
+            {lineNumbers.map((n) => (
+              <div key={n}>{n}</div>
+            ))}
+          </span>
+          <textarea
+            className="code-input"
+            rows={5}
+            spellCheck={false}
+            value={func}
+            onChange={(event) => setFunc(event.target.value)}
+            placeholder="void copy(char *dst, const char *src, size_t n) { memcpy(dst, src, n); }"
+          />
+        </span>
       </label>
 
       <label className="field">
-        <span className="field__label">修复提交链接</span>
+        <span className="field__label">
+          <GitCommitHorizontal size={14} aria-hidden="true" />
+          修复提交链接
+        </span>
         <input
           type="url"
           value={commitUrl}
@@ -143,24 +165,30 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
 
       <fieldset className="field">
         <legend className="field__label">版本选择</legend>
-        <div className="radio-row">
-          <label>
+        <div className="revision-grid">
+          <label className={`revision-card ${revision === "commit" ? "is-active" : ""}`}>
             <input
               type="radio"
               name="revision"
               checked={revision === "commit"}
               onChange={() => setRevision("commit")}
             />
-            该提交（revision=commit）
+            <span>
+              <span className="revision-card__title">该提交</span>
+              <span className="revision-card__sub">revision=commit</span>
+            </span>
           </label>
-          <label>
+          <label className={`revision-card ${revision === "parent" ? "is-active" : ""}`}>
             <input
               type="radio"
               name="revision"
               checked={revision === "parent"}
               onChange={() => setRevision("parent")}
             />
-            父提交（revision=parent）
+            <span>
+              <span className="revision-card__title">父提交</span>
+              <span className="revision-card__sub">revision=parent</span>
+            </span>
           </label>
         </div>
         <p className="field__hint">
@@ -169,23 +197,33 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
       </fieldset>
 
       <div className="button-row">
-        <button type="submit" className="button button--primary" disabled={disabled || busy}>
+        <button
+          type="submit"
+          className="button button--primary flex-1"
+          disabled={disabled || busy}
+        >
+          <Play size={14} aria-hidden="true" />
           {busy ? "准备快照并提交…" : "准备快照并开始检测"}
         </button>
+      </div>
+
+      <div className="button-row">
         <button
           type="button"
-          className="button"
+          className="button button--small flex-1"
           disabled={disabled}
           onClick={() => fillDemo(DEMO_SNAPSHOTS.vulnerable)}
         >
+          <FlaskConical size={13} aria-hidden="true" />
           {DEMO_SNAPSHOTS.vulnerable.label}
         </button>
         <button
           type="button"
-          className="button"
+          className="button button--small flex-1"
           disabled={disabled}
           onClick={() => fillDemo(DEMO_SNAPSHOTS.fixed)}
         >
+          <ShieldCheck size={13} aria-hidden="true" />
           {DEMO_SNAPSHOTS.fixed.label}
         </button>
       </div>
@@ -197,7 +235,10 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
 
       {prepared !== null && (
         <div className="prepared">
-          <p className="prepared__title">快照已准备</p>
+          <p className="prepared__title">
+            <CheckCircle2 size={15} aria-hidden="true" />
+            快照已准备
+          </p>
           <dl className="kv">
             <div>
               <dt>idx</dt>
@@ -208,7 +249,9 @@ export function SingleInputForm({ mode, disabled, onPendingChange, onStarted }: 
               <dd className="mono">{prepared.snapshot_ref}</dd>
             </div>
           </dl>
-          <p className="field__hint">快照引用为不透明标识，界面与模型都不会看到标签或版本语义。</p>
+          <p className="field__hint mt-2">
+            快照引用为不透明标识，界面与模型都不会看到标签或版本语义。
+          </p>
         </div>
       )}
     </form>
